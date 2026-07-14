@@ -146,6 +146,160 @@ class TestConsolidationIntegration:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    async def test_named_strategy_durably_excludes_memory_from_consolidation(
+        self, memory: MemoryEngine, request_context
+    ):
+        """A strategy-excluded fact stays retrievable but never enters consolidation."""
+        bank_id = f"test-consolidation-excluded-{uuid.uuid4().hex[:8]}"
+        await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+
+        try:
+            await memory._config_resolver.update_bank_config(
+                bank_id,
+                {
+                    "enable_auto_consolidation": False,
+                    "retain_strategies": {
+                        "checkpoint": {
+                            "retain_extraction_mode": "chunks",
+                            "retain_exclude_from_consolidation": True,
+                        }
+                    },
+                },
+                request_context,
+            )
+
+            unit_ids_by_content = await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[{"content": "Checkpoint-only group-chat transcript."}],
+                strategy="checkpoint",
+                request_context=request_context,
+            )
+            memory_id = unit_ids_by_content[0][0]
+
+            async with memory._pool.acquire() as conn:
+                stored = await conn.fetchrow(
+                    "SELECT exclude_from_consolidation, consolidated_at FROM memory_units WHERE id = $1",
+                    memory_id,
+                )
+            assert stored["exclude_from_consolidation"] is True
+            assert stored["consolidated_at"] is None
+
+            listed = await memory.list_memory_units(bank_id, request_context=request_context)
+            item = next(item for item in listed["items"] if item["id"] == memory_id)
+            assert item["exclude_from_consolidation"] is True
+            pending = await memory.list_memory_units(
+                bank_id,
+                consolidation_state="pending",
+                request_context=request_context,
+            )
+            assert memory_id not in {item["id"] for item in pending["items"]}
+
+            # Even if maintenance encounters a partially-corrupted excluded
+            # row, it must not leak into freshness, failure recovery, or any
+            # consolidation-state selector.
+            async with memory._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE memory_units
+                    SET consolidated_at = NOW(), consolidation_failed_at = NOW()
+                    WHERE id = $1
+                    """,
+                    memory_id,
+                )
+
+            await memory._bank_stats_cache.clear()
+            stats = await memory.get_bank_stats(bank_id, request_context=request_context, force_refresh=True)
+            freshness = await memory.get_bank_freshness(bank_id, request_context=request_context)
+            assert stats["pending_consolidation"] == 0
+            assert stats["failed_consolidation"] == 0
+            assert stats["last_consolidated_at"] is None
+            assert freshness["pending_consolidation"] == 0
+            assert freshness["failed_consolidation"] == 0
+            assert freshness["last_consolidated_at"] is None
+
+            failed = await memory.list_memory_units(
+                bank_id,
+                consolidation_state="failed",
+                request_context=request_context,
+            )
+            assert memory_id not in {item["id"] for item in failed["items"]}
+
+            retry = await memory.retry_failed_consolidation(bank_id, request_context=request_context)
+            assert retry == {"retried_count": 0}
+            async with memory._pool.acquire() as conn:
+                still_failed = await conn.fetchval(
+                    "SELECT consolidation_failed_at IS NOT NULL FROM memory_units WHERE id = $1",
+                    memory_id,
+                )
+                assert still_failed is True
+                await conn.execute(
+                    """
+                    UPDATE memory_units
+                    SET consolidated_at = NULL, consolidation_failed_at = NULL
+                    WHERE id = $1
+                    """,
+                    memory_id,
+                )
+
+            # Curation uses the live/archive shared-column projection. The flag
+            # must survive both directions instead of being reset to the default.
+            with (
+                patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+                patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+            ):
+                await memory.update_memory_unit(
+                    bank_id,
+                    memory_id,
+                    state="invalidated",
+                    request_context=request_context,
+                )
+                archived = await memory.list_memory_units(
+                    bank_id,
+                    state="invalidated",
+                    request_context=request_context,
+                )
+                archived_item = next(item for item in archived["items"] if item["id"] == memory_id)
+                assert archived_item["exclude_from_consolidation"] is True
+
+                await memory.update_memory_unit(
+                    bank_id,
+                    memory_id,
+                    state="valid",
+                    request_context=request_context,
+                )
+
+            async with memory._pool.acquire() as conn:
+                restored_flag = await conn.fetchval(
+                    "SELECT exclude_from_consolidation FROM memory_units WHERE id = $1",
+                    memory_id,
+                )
+            assert restored_flag is True
+
+            # Enable scheduling to prove the maintenance routine excludes this
+            # bank because of the row flag, not because auto-consolidation is off.
+            await memory._config_resolver.update_bank_config(
+                bank_id,
+                {"enable_auto_consolidation": True},
+                request_context,
+            )
+            async with memory._pool.acquire() as conn:
+                scheduled = await conn.fetch(
+                    "SELECT bank_id FROM public.banks_needing_consolidation() WHERE bank_id = $1",
+                    bank_id,
+                )
+            assert scheduled == []
+
+            result = await run_consolidation_job(
+                memory_engine=memory,
+                bank_id=bank_id,
+                request_context=request_context,
+            )
+            assert result["status"] == "no_new_memories"
+            assert result["memories_processed"] == 0
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
     async def test_consolidation_respects_last_consolidated_at(self, memory: MemoryEngine, request_context):
         """Test that consolidation only processes memories created after last_consolidated_at."""
         bank_id = f"test-consolidation-timestamp-{uuid.uuid4().hex[:8]}"

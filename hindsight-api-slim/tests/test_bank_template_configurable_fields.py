@@ -33,6 +33,7 @@ NEW_FIELDS: list[tuple[str, object]] = [
     ("retain_structured_chunk_size", 6000),
     ("retain_default_strategy", "strategy-a"),
     ("retain_strategies", {"strategy-a": {"mode": "concise", "max_tokens": 512}}),
+    ("retain_exclude_from_consolidation", True),
     ("retain_chunk_batch_size", 7),
     ("mcp_enabled_tools", ["list_banks", "get_bank_profile"]),
     ("consolidation_llm_batch_size", 11),

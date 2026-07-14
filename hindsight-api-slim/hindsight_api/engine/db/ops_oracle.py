@@ -95,6 +95,7 @@ class OracleOps(DataAccessOps):
         observation_scopes_list: list,
         text_signals_list: list,
         text_search_extension: str = "native",
+        exclude_from_consolidation: bool = False,
     ) -> list[str]:
         table = self._get_mu_table()
         # Generate UUIDs client-side so we can use executemany (single network

@@ -156,6 +156,25 @@ def test_retain_strategy_structured_chunk_size_validation():
     assert resolved.retain_structured_chunk_size == 2000
 
 
+def test_retain_strategy_resolves_consolidation_exclusion():
+    """The exclusion flag defaults off and can be enabled by a named strategy."""
+    from hindsight_api.config import HindsightConfig
+    from hindsight_api.config_resolver import apply_strategy
+
+    config = HindsightConfig.from_env()
+    assert config.retain_exclude_from_consolidation is False
+    config.retain_strategies = {
+        "checkpoint": {"retain_exclude_from_consolidation": True},
+        "ordinary": {},
+    }
+
+    resolved = apply_strategy(config, "checkpoint")
+
+    assert resolved.retain_exclude_from_consolidation is True
+    assert config.retain_exclude_from_consolidation is False
+    assert apply_strategy(config, "ordinary").retain_exclude_from_consolidation is False
+
+
 def test_semantic_min_similarity_reads_from_env():
     """Semantic retrieval min similarity can be configured at the server level."""
     from hindsight_api.config import HindsightConfig

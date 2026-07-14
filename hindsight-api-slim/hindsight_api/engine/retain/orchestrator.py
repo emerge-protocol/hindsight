@@ -440,7 +440,13 @@ async def _insert_facts_and_links(
     memory_links here.
     """
     set_stage("retain.phase2.insert_facts")
-    unit_ids = await fact_storage.insert_facts_batch(conn, bank_id, processed_facts, ops=ops)
+    unit_ids = await fact_storage.insert_facts_batch(
+        conn,
+        bank_id,
+        processed_facts,
+        ops=ops,
+        exclude_from_consolidation=config.retain_exclude_from_consolidation,
+    )
     step_start = time.time()
     log_buffer.append(f"  Insert facts: {len(unit_ids)} units in {time.time() - step_start:.3f}s")
 

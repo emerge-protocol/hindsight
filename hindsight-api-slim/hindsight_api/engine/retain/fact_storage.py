@@ -36,7 +36,13 @@ async def get_document_content(
 
 
 async def insert_facts_batch(
-    conn, bank_id: str, facts: list[ProcessedFact], document_id: str | None = None, ops=None
+    conn,
+    bank_id: str,
+    facts: list[ProcessedFact],
+    document_id: str | None = None,
+    ops=None,
+    *,
+    exclude_from_consolidation: bool = False,
 ) -> list[str]:
     """
     Insert facts into the database in batch.
@@ -129,6 +135,7 @@ async def insert_facts_batch(
         observation_scopes_list,
         text_signals_list,
         text_search_extension=config.text_search_extension,
+        exclude_from_consolidation=exclude_from_consolidation,
     )
 
 
