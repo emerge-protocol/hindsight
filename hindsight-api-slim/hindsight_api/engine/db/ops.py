@@ -50,6 +50,20 @@ class DataAccessOps(ABC):
         """
         return True  # Default: use junction table (Oracle)
 
+    @property
+    def consolidation_eligible_predicate(self) -> str:
+        """SQL predicate that limits source facts to consolidation-eligible rows.
+
+        Backends without the dedicated exclusion column keep the historical
+        behaviour. PostgreSQL overrides this after its forward migration.
+        """
+        return "1 = 1"
+
+    @property
+    def consolidation_exclusion_projection(self) -> str:
+        """SQL expression exposing the exclusion flag in memory-unit readback."""
+        return "0 AS exclude_from_consolidation"
+
     # -- Bulk insert operations ------------------------------------------
 
     @abstractmethod
@@ -115,6 +129,7 @@ class DataAccessOps(ABC):
         observation_scopes_list: list,
         text_signals_list: list,
         text_search_extension: str = "native",
+        exclude_from_consolidation: bool = False,
     ) -> list[str]:
         """Batch-insert facts, returning IDs.
 

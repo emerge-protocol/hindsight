@@ -566,7 +566,7 @@ def apply_strategy(config: HindsightConfig, strategy_name: str) -> HindsightConf
     A strategy is a named set of hierarchical field overrides stored in
     config.retain_strategies. Any field in _HIERARCHICAL_FIELDS can be
     overridden, including retain_extraction_mode, retain_chunk_size,
-    retain_structured_chunk_size, entity_labels,
+    retain_structured_chunk_size, retain_exclude_from_consolidation, entity_labels,
     entities_allow_free_form, etc.
 
     Unknown strategy names log a warning and return config unchanged.

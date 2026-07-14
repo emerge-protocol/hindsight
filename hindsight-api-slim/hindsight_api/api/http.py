@@ -2233,6 +2233,10 @@ class BankTemplateConfig(BaseModel):
     retain_strategies: dict | None = Field(
         default=None, description="Map of retain strategy name to per-strategy config dict"
     )
+    retain_exclude_from_consolidation: bool | None = Field(
+        default=None,
+        description="Store retained source facts without making them eligible for observation consolidation",
+    )
     retain_chunk_batch_size: int | None = Field(
         default=None, description="Max chunks per streaming batch (0 disables batching)"
     )
@@ -2820,6 +2824,9 @@ class FeaturesInfo(BaseModel):
     llm_trace: bool = Field(description="Whether per-bank LLM request tracing is enabled")
     store_document_text: bool = Field(
         description="Whether raw source text is persisted. When false, document/chunk source text is not stored."
+    )
+    retain_consolidation_exclusion: bool = Field(
+        description="Whether named retain strategies can durably exclude source facts from consolidation"
     )
 
 
@@ -3507,6 +3514,7 @@ def _register_routes(app: FastAPI):
                 audit_log=config.audit_log_enabled,
                 llm_trace=config.llm_trace_enabled,
                 store_document_text=config.store_document_text,
+                retain_consolidation_exclusion=config.database_backend == "postgresql",
             ),
         )
 

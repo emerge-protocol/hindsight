@@ -789,6 +789,7 @@ async def _run_consolidation_job(
         return {"status": "disabled", "bank_id": bank_id}
 
     pool = memory_engine._backend
+    consolidation_eligible_predicate = pool.ops.consolidation_eligible_predicate
 
     # Get bank profile
     async with acquire_with_retry(pool) as conn:
@@ -828,6 +829,7 @@ async def _run_consolidation_job(
             WHERE bank_id = $1
               AND consolidated_at IS NULL
               AND consolidation_failed_at IS NULL
+              AND {consolidation_eligible_predicate}
               AND fact_type IN ('experience', 'world')
               {scope_clause}
             """,
@@ -864,6 +866,7 @@ async def _run_consolidation_job(
                 WHERE bank_id = $1
                   AND consolidated_at IS NULL
                   AND consolidation_failed_at IS NULL
+                  AND {consolidation_eligible_predicate}
                   AND fact_type IN ('experience', 'world')
                   {scope_clause}
                 """,
@@ -931,6 +934,7 @@ async def _run_consolidation_job(
                 WHERE bank_id = $1
                   AND consolidated_at IS NULL
                   AND consolidation_failed_at IS NULL
+                  AND {consolidation_eligible_predicate}
                   AND fact_type IN ('experience', 'world')
                   {scope_clause}
                 ORDER BY created_at ASC

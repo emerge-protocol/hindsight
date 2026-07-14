@@ -129,8 +129,11 @@ async def test_refresh_backlog_uses_index_matched_predicates_not_filter_scan():
     mem_queries = [s for s in captured if "memory_units" in s and "COUNT(*)" in s]
     assert len(mem_queries) == 2  # split, not a single two-FILTER aggregate
     assert all("FILTER" not in s for s in mem_queries)
-    assert any("consolidated_at IS NULL AND fact_type IN ('experience', 'world')" in s for s in mem_queries)
-    assert any("consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world')" in s for s in mem_queries)
+    assert all("exclude_from_consolidation = false" in s for s in mem_queries)
+    assert any("consolidated_at IS NULL" in s and "fact_type IN ('experience', 'world')" in s for s in mem_queries)
+    assert any(
+        "consolidation_failed_at IS NOT NULL" in s and "fact_type IN ('experience', 'world')" in s for s in mem_queries
+    )
 
     ops_sql = next(s for s in captured if "async_operations" in s and "GROUP BY" in s)
     assert "status IN ('pending', 'processing', 'failed')" in ops_sql

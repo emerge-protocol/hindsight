@@ -209,6 +209,19 @@
           "description": "Map of retain strategy name to per-strategy config dict",
           "title": "Retain Strategies"
         },
+        "retain_exclude_from_consolidation": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Store retained source facts without making them eligible for observation consolidation",
+          "title": "Retain Exclude From Consolidation"
+        },
         "retain_chunk_batch_size": {
           "anyOf": [
             {

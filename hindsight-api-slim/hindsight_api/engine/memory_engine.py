@@ -6306,11 +6306,13 @@ class MemoryEngine(MemoryEngineInterface):
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         backend = await self._get_backend()
+        consolidation_eligible_predicate = backend.ops.consolidation_eligible_predicate
         async with acquire_with_retry(backend) as conn:
             count = await conn.fetchval(
                 f"""
                 SELECT COUNT(*) FROM {fq_table("memory_units")}
                 WHERE bank_id = $1
+                  AND {consolidation_eligible_predicate}
                   AND consolidation_failed_at IS NOT NULL
                   AND fact_type IN ('experience', 'world')
                 """,
@@ -6321,6 +6323,7 @@ class MemoryEngine(MemoryEngineInterface):
                 UPDATE {fq_table("memory_units")}
                 SET consolidation_failed_at = NULL, consolidated_at = NULL
                 WHERE bank_id = $1
+                  AND {consolidation_eligible_predicate}
                   AND consolidation_failed_at IS NOT NULL
                   AND fact_type IN ('experience', 'world')
                 """,
@@ -7371,6 +7374,8 @@ class MemoryEngine(MemoryEngineInterface):
         is_archived = state == "invalidated"
         source_table = fq_table("invalidated_memory_units") if is_archived else fq_table("memory_units")
         backend = await self._get_backend()
+        consolidation_eligible_predicate = backend.ops.consolidation_eligible_predicate
+        consolidation_exclusion_projection = backend.ops.consolidation_exclusion_projection
         async with acquire_with_retry(backend) as conn:
             # Build query conditions
             query_conditions = []
@@ -7402,15 +7407,20 @@ class MemoryEngine(MemoryEngineInterface):
                 state = consolidation_state.lower()
                 if state == "failed":
                     query_conditions.append(
-                        "consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world')"
+                        "consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world') "
+                        f"AND {consolidation_eligible_predicate}"
                     )
                 elif state == "pending":
                     query_conditions.append(
                         "consolidated_at IS NULL AND consolidation_failed_at IS NULL "
-                        "AND fact_type IN ('experience', 'world')"
+                        "AND fact_type IN ('experience', 'world') "
+                        f"AND {consolidation_eligible_predicate}"
                     )
                 elif state == "done":
-                    query_conditions.append("consolidated_at IS NOT NULL AND fact_type IN ('experience', 'world')")
+                    query_conditions.append(
+                        "consolidated_at IS NOT NULL AND fact_type IN ('experience', 'world') "
+                        f"AND {consolidation_eligible_predicate}"
+                    )
                 else:
                     raise ValueError(
                         f"Invalid consolidation_state '{consolidation_state}': expected 'failed', 'pending', or 'done'."
@@ -7446,7 +7456,8 @@ class MemoryEngine(MemoryEngineInterface):
                 f"""
                 SELECT id, text, event_date, context, fact_type, document_id,
                        mentioned_at, occurred_start, occurred_end, chunk_id, proof_count,
-                       tags, consolidated_at, consolidation_failed_at, edited_at, {curation_cols}
+                       tags, consolidated_at, consolidation_failed_at, edited_at,
+                       {consolidation_exclusion_projection}, {curation_cols}
                 FROM {source_table}
                 {where_clause}
                 ORDER BY mentioned_at DESC NULLS LAST, created_at DESC
@@ -7505,6 +7516,7 @@ class MemoryEngine(MemoryEngineInterface):
                         "consolidation_failed_at": (
                             row["consolidation_failed_at"].isoformat() if row["consolidation_failed_at"] else None
                         ),
+                        "exclude_from_consolidation": bool(row["exclude_from_consolidation"]),
                         "state": "invalidated" if is_archived else "valid",
                         "invalidation_reason": row["invalidation_reason"],
                         "invalidated_at": row["invalidated_at"].isoformat() if row["invalidated_at"] else None,
@@ -9770,6 +9782,7 @@ class MemoryEngine(MemoryEngineInterface):
 
     async def _compute_bank_stats(self, bank_id: str) -> dict[str, Any]:
         backend = await self._get_backend()
+        consolidation_eligible_predicate = backend.ops.consolidation_eligible_predicate
 
         async with acquire_with_retry(backend) as conn:
             # Get node counts by fact_type
@@ -9852,9 +9865,19 @@ class MemoryEngine(MemoryEngineInterface):
             consolidation_row = await conn.fetchrow(
                 f"""
                 SELECT
-                    MAX(consolidated_at) as last_consolidated_at,
-                    COUNT(*) FILTER (WHERE consolidated_at IS NULL AND fact_type IN ('experience', 'world')) as pending,
-                    COUNT(*) FILTER (WHERE consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world')) as failed
+                    MAX(consolidated_at) FILTER (
+                        WHERE {consolidation_eligible_predicate}
+                    ) as last_consolidated_at,
+                    COUNT(*) FILTER (
+                        WHERE {consolidation_eligible_predicate}
+                          AND consolidated_at IS NULL
+                          AND fact_type IN ('experience', 'world')
+                    ) as pending,
+                    COUNT(*) FILTER (
+                        WHERE {consolidation_eligible_predicate}
+                          AND consolidation_failed_at IS NOT NULL
+                          AND fact_type IN ('experience', 'world')
+                    ) as failed
                 FROM {fq_table("memory_units")}
                 WHERE bank_id = $1
                 """,
@@ -9910,6 +9933,7 @@ class MemoryEngine(MemoryEngineInterface):
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
 
         backend = await self._get_backend()
+        consolidation_eligible_predicate = backend.ops.consolidation_eligible_predicate
         # The current reflect() caller reads only last_consolidated_at and
         # pending_consolidation, but `failed` is part of this method's published
         # contract (see interface.get_bank_freshness) so the returned shape stays
@@ -9919,9 +9943,19 @@ class MemoryEngine(MemoryEngineInterface):
             row = await conn.fetchrow(
                 f"""
                 SELECT
-                    MAX(consolidated_at) as last_consolidated_at,
-                    COUNT(*) FILTER (WHERE consolidated_at IS NULL AND fact_type IN ('experience', 'world')) as pending,
-                    COUNT(*) FILTER (WHERE consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world')) as failed
+                    MAX(consolidated_at) FILTER (
+                        WHERE {consolidation_eligible_predicate}
+                    ) as last_consolidated_at,
+                    COUNT(*) FILTER (
+                        WHERE {consolidation_eligible_predicate}
+                          AND consolidated_at IS NULL
+                          AND fact_type IN ('experience', 'world')
+                    ) as pending,
+                    COUNT(*) FILTER (
+                        WHERE {consolidation_eligible_predicate}
+                          AND consolidation_failed_at IS NOT NULL
+                          AND fact_type IN ('experience', 'world')
+                    ) as failed
                 FROM {fq_table("memory_units")}
                 WHERE bank_id = $1
                 """,

@@ -1965,6 +1965,10 @@ class HindsightConfig:
     file_parser_markitdown_ocr_base_url: str | None = None
     file_parser_markitdown_ocr_model: str | None = None
     file_parser_markitdown_ocr_prompt: str = DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
+    # Request/bank-scoped policy, intentionally not environment-backed: a global
+    # switch could silently suppress consolidation for every retained memory.
+    # Opt in through bank config or, preferably, a named retain strategy.
+    retain_exclude_from_consolidation: bool = False
 
     # Multi-LLM chains (static, server-level). Index 0 of each chain is the
     # corresponding unindexed/base LLM config above; these hold the extra indexed
@@ -2044,6 +2048,7 @@ class HindsightConfig:
         "retain_custom_instructions",
         "retain_default_strategy",
         "retain_strategies",
+        "retain_exclude_from_consolidation",
         "retain_chunk_batch_size",
         # Entity labels (controlled vocabulary for entity classification)
         "entity_labels",

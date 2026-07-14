@@ -16,6 +16,14 @@ class PostgreSQLOps(DataAccessOps):
     def uses_observation_sources_table(self) -> bool:
         return False  # PG uses native array ops on source_memory_ids
 
+    @property
+    def consolidation_eligible_predicate(self) -> str:
+        return "exclude_from_consolidation = false"
+
+    @property
+    def consolidation_exclusion_projection(self) -> str:
+        return "exclude_from_consolidation"
+
     async def bulk_upsert_chunks(
         self,
         conn: DatabaseConnection,
@@ -87,6 +95,7 @@ class PostgreSQLOps(DataAccessOps):
         observation_scopes_list: list,
         text_signals_list: list,
         text_search_extension: str = "native",
+        exclude_from_consolidation: bool = False,
     ) -> list[str]:
         from ...config import get_config
 
@@ -105,7 +114,8 @@ class PostgreSQLOps(DataAccessOps):
                 )
                 INSERT INTO {table} (bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
                                      context, fact_type, metadata, chunk_id, document_id, tags,
-                                     observation_scopes, text_signals, search_vector)
+                                     observation_scopes, text_signals, search_vector,
+                                     exclude_from_consolidation)
                 SELECT
                     $1,
                     text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
@@ -119,7 +129,8 @@ class PostgreSQLOps(DataAccessOps):
                     tokenize(
                         COALESCE(text, '') || ' ' || COALESCE(context, '') || ' ' || COALESCE(text_signals, ''),
                         'llmlingua2'
-                    )::bm25_catalog.bm25vector
+                    )::bm25_catalog.bm25vector,
+                    $16
                 FROM input_data
                 RETURNING id
             """
@@ -141,7 +152,8 @@ class PostgreSQLOps(DataAccessOps):
                 )
                 INSERT INTO {table} (bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
                                      context, fact_type, metadata, chunk_id, document_id, tags,
-                                     observation_scopes, text_signals, search_vector)
+                                     observation_scopes, text_signals, search_vector,
+                                     exclude_from_consolidation)
                 SELECT
                     $1,
                     text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
@@ -155,7 +167,8 @@ class PostgreSQLOps(DataAccessOps):
                     to_tsvector(
                         '{config.text_search_extension_native_language}'::regconfig,
                         COALESCE(text, '') || ' ' || COALESCE(context, '') || ' ' || COALESCE(text_signals, '')
-                    )
+                    ),
+                    $16
                 FROM input_data
                 RETURNING id
             """
@@ -174,7 +187,7 @@ class PostgreSQLOps(DataAccessOps):
                 )
                 INSERT INTO {table} (bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
                                      context, fact_type, metadata, chunk_id, document_id, tags,
-                                     observation_scopes, text_signals)
+                                     observation_scopes, text_signals, exclude_from_consolidation)
                 SELECT
                     $1,
                     text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
@@ -184,7 +197,8 @@ class PostgreSQLOps(DataAccessOps):
                         '{{}}'::varchar[]
                     ),
                     observation_scopes_json,
-                    text_signals
+                    text_signals,
+                    $16
                 FROM input_data
                 RETURNING id
             """
@@ -206,6 +220,7 @@ class PostgreSQLOps(DataAccessOps):
             tags_list,
             observation_scopes_list,
             text_signals_list,
+            exclude_from_consolidation,
         )
         return [str(row["id"]) for row in results]
 

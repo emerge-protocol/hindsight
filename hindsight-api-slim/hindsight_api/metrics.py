@@ -958,7 +958,9 @@ class MetricsCollector(MetricsCollectorBase):
                         rows = await conn.fetch(
                             f"SELECT {bank_sel}COUNT(*) AS count "
                             f'FROM "{schema}".memory_units '
-                            "WHERE consolidated_at IS NULL AND fact_type IN ('experience', 'world')"
+                            "WHERE consolidated_at IS NULL "
+                            "AND exclude_from_consolidation = false "
+                            "AND fact_type IN ('experience', 'world')"
                             f"{bank_grp}"
                         )
                     for row in rows:
@@ -972,7 +974,9 @@ class MetricsCollector(MetricsCollectorBase):
                     rows = await conn.fetch(
                         f"SELECT {bank_sel}COUNT(*) AS count "
                         f'FROM "{schema}".memory_units '
-                        "WHERE consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world')"
+                        "WHERE consolidation_failed_at IS NOT NULL "
+                        "AND exclude_from_consolidation = false "
+                        "AND fact_type IN ('experience', 'world')"
                         f"{bank_grp}"
                     )
                     for row in rows:
