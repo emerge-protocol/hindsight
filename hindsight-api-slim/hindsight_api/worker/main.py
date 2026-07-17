@@ -309,7 +309,10 @@ def main():
 
         await memory.initialize()
 
-        print(f"Database connected: {config.database_url}")
+        # A database URL can contain the worker login and password.  Startup
+        # logs are routinely collected by process supervisors, so report only
+        # the successful boundary and never serialize connection authority.
+        print("Database connected")
 
         if tenant_extension:
             print("Tenant extension loaded - schemas will be discovered dynamically on each poll")

@@ -1,12 +1,15 @@
 """Deterministic availability boundaries for the standalone worker."""
 
+import ast
 import asyncio
+import inspect
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from hindsight_api.engine.memory_engine import UnsupportedWorkerTaskError
+from hindsight_api.worker import main as worker_main
 from hindsight_api.worker.main import _wait_for_shutdown_or_worker_failure, create_worker_app
 from hindsight_api.worker.poller import (
     MAX_CONSECUTIVE_POLL_ERRORS,
@@ -15,6 +18,23 @@ from hindsight_api.worker.poller import (
     WorkerPoller,
     WorkerPollingUnavailableError,
 )
+
+
+def test_worker_output_never_serializes_database_url():
+    """Connection authority must not cross the worker's output boundary."""
+    tree = ast.parse(inspect.getsource(worker_main))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        is_print = isinstance(target, ast.Name) and target.id == "print"
+        is_logger = (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "logger"
+        )
+        if is_print or is_logger:
+            assert "database_url" not in ast.unparse(node)
 
 
 async def _cancel(task: asyncio.Task) -> None:
