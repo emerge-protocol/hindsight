@@ -248,10 +248,33 @@ def _batch_status(status: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_batch_poll_rechecks_claim_before_waiting_or_consuming_results():
+async def test_batch_poll_rechecks_claim_before_provider_status_call():
     connection = MagicMock()
     connection.fetchrow = AsyncMock(
         side_effect=[
+            {"result_metadata": {}},
+            {"result_metadata": {}},
+            None,
+        ]
+    )
+    connection.execute = AsyncMock(return_value="UPDATE 1")
+    pool = _ConnectionBackend(connection)
+    llm = _batch_llm()
+    llm._provider_impl.get_batch_status = AsyncMock(return_value=_batch_status("in_progress"))
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
+        await _under_claim(lambda: _run_minimal_batch_extract(pool, llm))
+
+    llm._provider_impl.get_batch_status.assert_not_awaited()
+    llm._provider_impl.retrieve_batch_results.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_poll_rechecks_claim_after_provider_status_call():
+    connection = MagicMock()
+    connection.fetchrow = AsyncMock(
+        side_effect=[
+            {"result_metadata": {}},
             {"result_metadata": {}},
             {"result_metadata": {}},
             None,
@@ -270,13 +293,39 @@ async def test_batch_poll_rechecks_claim_before_waiting_or_consuming_results():
 
 
 @pytest.mark.asyncio
+async def test_batch_results_recheck_claim_before_provider_retrieval():
+    connection = MagicMock()
+    connection.fetchrow = AsyncMock(
+        side_effect=[
+            {"result_metadata": {}},
+            {"result_metadata": {}},
+            {"result_metadata": {}},
+            {"result_metadata": {}},
+            None,
+        ]
+    )
+    connection.execute = AsyncMock(return_value="UPDATE 1")
+    pool = _ConnectionBackend(connection)
+    llm = _batch_llm()
+    llm._provider_impl.get_batch_status = AsyncMock(return_value=_batch_status("completed"))
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
+        await _under_claim(lambda: _run_minimal_batch_extract(pool, llm))
+
+    llm._provider_impl.get_batch_status.assert_awaited_once_with("batch-1")
+    llm._provider_impl.retrieve_batch_results.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_batch_results_recheck_claim_after_provider_retrieval():
     connection = MagicMock()
     connection.fetchrow = AsyncMock(
         side_effect=[
             {"result_metadata": {}},
             {"result_metadata": {}},
-            {"result_metadata": {"batch_id": "batch-1"}},
+            {"result_metadata": {}},
+            {"result_metadata": {}},
+            {"result_metadata": {}},
             None,
         ]
     )

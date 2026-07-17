@@ -2088,6 +2088,12 @@ async def extract_facts_from_contents_batch_api(
 
     start_time = time.time()
     while True:
+        # Sleeping gives another worker time to acquire a successor claim.
+        # Fence both sides of every provider read: the preflight prevents a
+        # stale execution from making the external call, while the postflight
+        # prevents it from consuming a response if authority moves in flight.
+        if operation_id and pool:
+            await _read_batch_operation_metadata(pool, table, operation_id, "poll provider batch for")
         status_info = await llm_config._provider_impl.get_batch_status(batch_id)
         if operation_id and pool:
             await _read_batch_operation_metadata(pool, table, operation_id, "poll provider batch for")
@@ -2112,6 +2118,8 @@ async def extract_facts_from_contents_batch_api(
     logger.info(f"Batch {batch_id} completed in {elapsed:.0f}s, retrieving results")
 
     # Step 4: Retrieve results
+    if operation_id and pool:
+        await _read_batch_operation_metadata(pool, table, operation_id, "consume provider batch results for")
     batch_results = await llm_config._provider_impl.retrieve_batch_results(batch_id)
     if operation_id and pool:
         await _read_batch_operation_metadata(pool, table, operation_id, "consume provider batch results for")

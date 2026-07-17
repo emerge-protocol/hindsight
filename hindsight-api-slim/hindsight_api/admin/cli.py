@@ -564,7 +564,7 @@ async def _decommission_all_workers(db_url: str, schema: str = "public") -> list
             FROM claimed
             WHERE operations.operation_id = claimed.operation_id
               AND operations.status = 'processing'
-              AND operations.worker_id = claimed.worker_id
+              AND operations.worker_id IS NOT DISTINCT FROM claimed.worker_id
               AND operations.claim_token IS NOT DISTINCT FROM claimed.claim_token
             RETURNING operations.operation_id, claimed.worker_id, claimed.operation_type
             """,
