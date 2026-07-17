@@ -1091,7 +1091,7 @@ async def test_version_endpoint_returns_correct_version(api_client):
     """
     from hindsight_api import __version__
 
-    assert __version__ == "0.8.4+morgan.1"
+    assert __version__ == "0.8.4+morgan.2"
 
     # Call the /version endpoint
     response = await api_client.get("/version")
