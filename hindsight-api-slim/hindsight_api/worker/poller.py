@@ -39,6 +39,10 @@ class WorkerPollingUnavailableError(RuntimeError):
     """The worker could not complete a bounded number of polling cycles."""
 
 
+class WorkerSchemaPollingError(RuntimeError):
+    """A configured schema could not complete a queue scan or claim."""
+
+
 def _metric_operation_label(operation_type: str | None) -> str:
     if operation_type in _RETAIN_OP_TYPES:
         return "retain"
@@ -283,7 +287,14 @@ class WorkerPoller:
     async def _scan_active_schemas_by_exists(
         self, conn: "DatabaseConnection", schemas: list[str | None]
     ) -> set[str | None]:
-        """Find active schemas using per-schema EXISTS checks."""
+        """Find active schemas using per-schema EXISTS checks.
+
+        Every schema returned by the tenant extension is authoritative.  A
+        failed probe cannot be treated as an empty schema: doing so would make
+        a single-schema worker report ready while silently processing nothing.
+        Fail immediately instead.  This also avoids issuing the remaining
+        tenant queries when the shared connection itself has failed.
+        """
         active: set[str | None] = set()
         for schema in schemas:
             table = fq_table("async_operations", schema)
@@ -294,8 +305,11 @@ class WorkerPoller:
                 )
                 if has_work:
                     active.add(schema)
-            except Exception:
-                pass
+            except Exception as e:
+                schema_display = f'"{schema}"' if schema else str(schema)
+                raise WorkerSchemaPollingError(
+                    f"Worker {self._worker_id} queue scan failed for configured schema {schema_display}"
+                ) from e
         return active
 
     async def _get_available_slots(self) -> SlotAvailability:
@@ -469,14 +483,20 @@ class WorkerPoller:
     async def _claim_batch_for_schema(
         self, schema: str | None, reserved_limits: dict[str, int], shared_limit: int
     ) -> list[ClaimedTask]:
-        """Claim tasks from a specific schema respecting per-type and shared slot limits."""
+        """Claim tasks from a configured schema or fail the whole poll cycle.
+
+        Returning an empty list on error is indistinguishable from a healthy
+        idle queue, especially in a single-schema deployment.  Propagate with
+        schema context so ``run`` clears readiness immediately and its bounded
+        error counter makes the supervised poller fatal after three attempts.
+        """
         try:
             return await self._claim_batch_for_schema_inner(schema, reserved_limits, shared_limit)
         except Exception as e:
-            # Format schema for logging: custom schemas in quotes, None as-is
             schema_display = f'"{schema}"' if schema else str(schema)
-            logger.warning(f"Worker {self._worker_id} failed to claim tasks for schema {schema_display}: {e}")
-            return []
+            raise WorkerSchemaPollingError(
+                f"Worker {self._worker_id} queue claim failed for configured schema {schema_display}"
+            ) from e
 
     async def _claim_batch_for_schema_inner(
         self, schema: str | None, reserved_limits: dict[str, int], shared_limit: int

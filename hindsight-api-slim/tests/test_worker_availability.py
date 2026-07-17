@@ -14,6 +14,7 @@ from hindsight_api.worker.poller import (
     WorkerBackgroundTaskError,
     WorkerPoller,
     WorkerPollingUnavailableError,
+    WorkerSchemaPollingError,
 )
 
 
@@ -202,6 +203,32 @@ async def test_persistent_claim_failure_degrades_health_then_fails_process():
     assert str(raised.value.__cause__) == "queue query denied"
     assert poller.claim_batch.await_count == MAX_CONSECUTIVE_POLL_ERRORS
     assert poller.is_ready is False
+
+
+@pytest.mark.asyncio
+async def test_any_configured_schema_scan_failure_fails_the_poll_cycle():
+    poller = _poller()
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=[True, RuntimeError("tenant_b scan denied")])
+
+    with pytest.raises(WorkerSchemaPollingError, match='scan failed for configured schema "tenant_b"') as raised:
+        await poller._scan_active_schemas_by_exists(conn, ["tenant_a", "tenant_b"])
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "tenant_b scan denied"
+    assert conn.fetchval.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_any_configured_schema_claim_failure_fails_the_poll_cycle():
+    poller = _poller()
+    poller._claim_batch_for_schema_inner = AsyncMock(side_effect=RuntimeError("tenant_a claim denied"))
+
+    with pytest.raises(WorkerSchemaPollingError, match='claim failed for configured schema "tenant_a"') as raised:
+        await poller._claim_batch_for_schema("tenant_a", {"retain": 1}, 1)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "tenant_a claim denied"
 
 
 @pytest.mark.asyncio
