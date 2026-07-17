@@ -6,16 +6,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hindsight_api.config import (
+    DEFAULT_WORKER_SATURATION_TIMEOUT_SECONDS,
+    ENV_WORKER_SATURATION_TIMEOUT_SECONDS,
+    HindsightConfig,
+)
 from hindsight_api.engine.memory_engine import UnsupportedWorkerTaskError
 from hindsight_api.worker.main import _wait_for_shutdown_or_worker_failure, create_worker_app
 from hindsight_api.worker.poller import (
     MAX_CONSECUTIVE_POLL_ERRORS,
+    ActiveTaskInfo,
     ClaimedTask,
     WorkerBackgroundTaskError,
     WorkerPoller,
     WorkerPollingUnavailableError,
+    WorkerSaturationTimeoutError,
     WorkerSchemaPollingError,
 )
+from hindsight_api.worker.stage import StageHolder
 
 
 async def _cancel(task: asyncio.Task) -> None:
@@ -133,6 +141,138 @@ def _poller() -> WorkerPoller:
         executor=AsyncMock(),
         tenant_extension=tenant_extension,
     )
+
+
+def test_saturation_timeout_is_explicit_bounded_config(monkeypatch):
+    monkeypatch.delenv(ENV_WORKER_SATURATION_TIMEOUT_SECONDS, raising=False)
+    assert HindsightConfig.from_env().worker_saturation_timeout_seconds == DEFAULT_WORKER_SATURATION_TIMEOUT_SECONDS
+
+    monkeypatch.setenv(ENV_WORKER_SATURATION_TIMEOUT_SECONDS, "1200")
+    assert HindsightConfig.from_env().worker_saturation_timeout_seconds == 1200
+
+    monkeypatch.setenv(ENV_WORKER_SATURATION_TIMEOUT_SECONDS, "299")
+    with pytest.raises(ValueError, match="must be at least 300 seconds"):
+        HindsightConfig.from_env()
+
+
+async def _install_active_tasks(
+    poller: WorkerPoller,
+    *,
+    started_at: float,
+    stage_updates: list[float],
+) -> list[asyncio.Task]:
+    tasks = [asyncio.create_task(asyncio.Event().wait()) for _ in stage_updates]
+    async with poller._in_flight_lock:
+        poller._active_tasks = {
+            f"operation-{index}": ActiveTaskInfo(
+                op_type="retain",
+                bank_id=f"bank-{index}",
+                schema="tenant_a",
+                bg_task=task,
+                started_at=started_at,
+                stage_holder=StageHolder(stage="llm.openrouter.retain", updated_at=updated_at),
+                task_type="batch_retain",
+            )
+            for index, (task, updated_at) in enumerate(zip(tasks, stage_updates, strict=True))
+        }
+        poller._in_flight_count = len(tasks)
+        poller._in_flight_by_type = {"retain": len(tasks)}
+    return tasks
+
+
+async def _cancel_all(tasks: list[asyncio.Task]) -> None:
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_full_saturation_without_progress_clears_readiness_and_fails():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=2,
+        saturation_timeout_seconds=300,
+    )
+    tasks = await _install_active_tasks(poller, started_at=100.0, stage_updates=[200.0, 250.0])
+    poller._ready = True
+    try:
+        with (
+            patch("hindsight_api.worker.poller.time.monotonic", return_value=550.0),
+            pytest.raises(WorkerSaturationTimeoutError, match="occupied all 2 slots") as raised,
+        ):
+            await poller._raise_if_saturated_without_progress()
+        assert "without task/stage progress for 300.0s" in str(raised.value)
+        assert poller.is_ready is False
+    finally:
+        await _cancel_all(tasks)
+
+
+@pytest.mark.asyncio
+async def test_full_saturation_with_recent_stage_progress_remains_ready():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=2,
+        saturation_timeout_seconds=300,
+    )
+    tasks = await _install_active_tasks(poller, started_at=100.0, stage_updates=[200.0, 500.0])
+    poller._ready = True
+    try:
+        with patch("hindsight_api.worker.poller.time.monotonic", return_value=550.0):
+            await poller._raise_if_saturated_without_progress()
+        assert poller.is_ready is True
+    finally:
+        await _cancel_all(tasks)
+
+
+@pytest.mark.asyncio
+async def test_partial_occupancy_does_not_trigger_saturation_recovery():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=2,
+        saturation_timeout_seconds=300,
+    )
+    tasks = await _install_active_tasks(poller, started_at=100.0, stage_updates=[200.0])
+    poller._ready = True
+    try:
+        with patch("hindsight_api.worker.poller.time.monotonic", return_value=1000.0):
+            await poller._raise_if_saturated_without_progress()
+        assert poller.is_ready is True
+    finally:
+        await _cancel_all(tasks)
+
+
+@pytest.mark.asyncio
+async def test_saturation_timeout_is_supervised_fatal_without_poll_retries():
+    poller = _poller()
+    poller.recover_own_tasks = AsyncMock(return_value=0)
+    poller._raise_if_saturated_without_progress = AsyncMock(
+        side_effect=WorkerSaturationTimeoutError("all slots wedged")
+    )
+    poller.claim_batch = AsyncMock()
+
+    poller_task = asyncio.create_task(poller.run())
+    http_task = asyncio.create_task(asyncio.Event().wait())
+    try:
+        with pytest.raises(RuntimeError, match="poller task failed") as raised:
+            await _wait_for_shutdown_or_worker_failure(asyncio.Event(), poller_task, http_task)
+        assert isinstance(raised.value.__cause__, WorkerSaturationTimeoutError)
+        assert str(raised.value.__cause__) == "all slots wedged"
+    finally:
+        await _cancel(http_task)
+
+    poller.claim_batch.assert_not_awaited()
+    assert poller.is_ready is False
 
 
 @pytest.mark.asyncio

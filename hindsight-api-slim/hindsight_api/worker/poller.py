@@ -43,6 +43,10 @@ class WorkerSchemaPollingError(RuntimeError):
     """A configured schema could not complete a queue scan or claim."""
 
 
+class WorkerSaturationTimeoutError(RuntimeError):
+    """Every worker slot remained occupied without task/stage progress."""
+
+
 def _metric_operation_label(operation_type: str | None) -> str:
     if operation_type in _RETAIN_OP_TYPES:
         return "retain"
@@ -164,6 +168,7 @@ class WorkerPoller:
         schema: str | None = None,
         tenant_extension: "TenantExtension | None" = None,
         max_slots: int = 10,
+        saturation_timeout_seconds: float | None = None,
         slot_reservations: dict[str, int] | None = None,
         consolidation_bank_priority: dict[str, int] | None = None,
     ):
@@ -179,6 +184,12 @@ class WorkerPoller:
             tenant_extension: Extension for dynamic multi-tenant discovery. If None, creates a
                             DefaultTenantExtension with the configured schema.
             max_slots: Maximum concurrent tasks per worker
+            saturation_timeout_seconds: Optional fatal recovery boundary when
+                every slot remains occupied and no tracked task starts or
+                changes stage. Must be at least the first stuck-stack threshold
+                (5 minutes). The supervised standalone worker configures this;
+                embedded pollers leave it disabled because they do not own the
+                host process lifecycle.
             slot_reservations: Per-operation-type reserved slot counts (e.g. {"consolidation": 2,
                 "retain": 3}). Reserved slots guarantee capacity for that operation type.
                 Remaining slots (max_slots - sum of reservations) form a shared pool usable
@@ -203,6 +214,9 @@ class WorkerPoller:
             tenant_extension = DefaultTenantExtension(config=config)
         self._tenant_extension = tenant_extension
         self._max_slots = max_slots
+        if saturation_timeout_seconds is not None and saturation_timeout_seconds < STUCK_STACK_INITIAL_THRESHOLD_S:
+            raise ValueError(f"saturation_timeout_seconds must be at least {STUCK_STACK_INITIAL_THRESHOLD_S} seconds")
+        self._saturation_timeout_seconds = saturation_timeout_seconds
         self._slot_reservations: dict[str, int] = (
             slot_reservations if slot_reservations is not None else {"consolidation": 2}
         )
@@ -343,6 +357,38 @@ class WorkerPoller:
         shared_available = max(0, shared_pool_size - tasks_in_shared)
 
         return SlotAvailability(reserved=reserved_available, shared=shared_available)
+
+    async def _raise_if_saturated_without_progress(self) -> None:
+        """Fail the availability unit when every slot is durably wedged.
+
+        A full worker is healthy while at least one task starts or crosses an
+        explicit engine stage inside the configured window.  When all slots are
+        occupied and the newest such progress is older than that window, no new
+        queue work can be admitted.  Clear readiness before raising so health
+        turns red immediately; the standalone-worker supervisor then tears down
+        the process, and startup recovery returns its claims to pending.
+        """
+        if self._saturation_timeout_seconds is None:
+            return
+        now = time.monotonic()
+        async with self._in_flight_lock:
+            if self._in_flight_count < self._max_slots:
+                return
+            active_tasks = tuple(self._active_tasks.values())
+            # A completed task whose cleanup callback is waiting on this lock is
+            # proof of forward progress, not a reason to race a fatal restart.
+            if len(active_tasks) < self._max_slots or any(info.bg_task.done() for info in active_tasks):
+                return
+            latest_progress_at = max(max(info.started_at, info.stage_holder.updated_at) for info in active_tasks)
+            stalled_for = max(0.0, now - latest_progress_at)
+            if stalled_for < self._saturation_timeout_seconds:
+                return
+            self._ready = False
+            raise WorkerSaturationTimeoutError(
+                f"Worker {self._worker_id} occupied all {self._max_slots} slots without "
+                f"task/stage progress for {stalled_for:.1f}s "
+                f"(limit={self._saturation_timeout_seconds:.1f}s)"
+            )
 
     async def wait_for_active_tasks(self, timeout: float = 10.0) -> bool:
         """
@@ -1013,6 +1059,7 @@ class WorkerPoller:
         try:
             while not self._shutdown.is_set():
                 self._raise_if_background_task_failed()
+                await self._raise_if_saturated_without_progress()
                 try:
                     # Claim a batch of tasks (respecting slot limits).  The
                     # worker does not become ready until the complete cycle
@@ -1060,7 +1107,7 @@ class WorkerPoller:
                     # Wait before polling again
                     await self._wait_for_poll_interval_or_stop()
 
-                except WorkerBackgroundTaskError:
+                except (WorkerBackgroundTaskError, WorkerSaturationTimeoutError):
                     raise
                 except asyncio.CancelledError:
                     logger.info(f"Worker {self._worker_id} polling loop cancelled")
