@@ -24,6 +24,14 @@ class QueueClaim:
     claim_token: str | None
 
 
+@dataclass(frozen=True)
+class QueueClaimPredicate:
+    """SQL fragment and parameters for an exact queue claim fence."""
+
+    sql: str
+    args: tuple[str, ...]
+
+
 _current_queue_claim: contextvars.ContextVar[QueueClaim | None] = contextvars.ContextVar(
     "current_queue_claim", default=None
 )
@@ -72,16 +80,16 @@ def active_queue_claim() -> QueueClaim | None:
     return claim
 
 
-def queue_claim_predicate(first_parameter: int) -> tuple[str, tuple[str, str]]:
+def queue_claim_predicate(first_parameter: int) -> QueueClaimPredicate:
     """Build an exact status/owner/generation SQL fence for worker reads or writes."""
 
     claim = active_queue_claim()
     if claim is None:
-        return "", ()
+        return QueueClaimPredicate(sql="", args=())
     assert claim.worker_id is not None and claim.claim_token is not None
-    return (
-        f" AND status = 'processing' AND worker_id = ${first_parameter} AND claim_token = ${first_parameter + 1}",
-        (claim.worker_id, claim.claim_token),
+    return QueueClaimPredicate(
+        sql=(f" AND status = 'processing' AND worker_id = ${first_parameter} AND claim_token = ${first_parameter + 1}"),
+        args=(claim.worker_id, claim.claim_token),
     )
 
 

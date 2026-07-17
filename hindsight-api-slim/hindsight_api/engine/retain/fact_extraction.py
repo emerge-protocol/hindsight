@@ -1880,11 +1880,11 @@ async def _read_batch_operation_metadata(
     from ..db_utils import acquire_with_retry
 
     async with acquire_with_retry(pool) as conn:
-        claim_predicate, claim_args = queue_claim_predicate(2)
+        claim_fence = queue_claim_predicate(2)
         row = await conn.fetchrow(
-            f"SELECT result_metadata FROM {table} WHERE operation_id = $1{claim_predicate}",
+            f"SELECT result_metadata FROM {table} WHERE operation_id = $1{claim_fence.sql}",
             operation_id,
-            *claim_args,
+            *claim_fence.args,
         )
         require_guarded_row(row, operation_id, action)
         return row
@@ -1901,16 +1901,16 @@ async def _write_batch_operation_state(
     from ..db_utils import acquire_with_retry
 
     async with acquire_with_retry(pool) as conn:
-        claim_predicate, claim_args = queue_claim_predicate(3)
+        claim_fence = queue_claim_predicate(3)
         result = await conn.execute(
             f"""
             UPDATE {table}
             SET result_metadata = result_metadata || $1::jsonb, updated_at = now()
-            WHERE operation_id = $2{claim_predicate}
+            WHERE operation_id = $2{claim_fence.sql}
             """,
             json.dumps(batch_state),
             operation_id,
-            *claim_args,
+            *claim_fence.args,
         )
         require_guarded_update(result, operation_id, "save provider batch state for")
 
@@ -1936,17 +1936,17 @@ async def _write_batch_extraction_errors(
     # unrelated keys (e.g. batch_id) already on result_metadata.
     table = fq_table("async_operations", schema)
     async with acquire_with_retry(pool) as conn:
-        claim_predicate, claim_args = queue_claim_predicate(3)
+        claim_fence = queue_claim_predicate(3)
         result = await conn.execute(
             f"""
             UPDATE {table}
             SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb,
                 updated_at = now()
-            WHERE operation_id = $1{claim_predicate}
+            WHERE operation_id = $1{claim_fence.sql}
             """,
             operation_id,
             json.dumps(errors.to_dict()),
-            *claim_args,
+            *claim_fence.args,
         )
         require_guarded_update(result, operation_id, "write batch extraction errors for")
 

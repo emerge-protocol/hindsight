@@ -1475,14 +1475,14 @@ class MemoryEngine(MemoryEngineInterface):
             }
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
-                claim_predicate, claim_args = _queue_claim_predicate(3)
+                claim_fence = _queue_claim_predicate(3)
                 update_result = await conn.execute(
                     f"UPDATE {fq_table('async_operations')} "
                     f"SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $1::jsonb "
-                    f"WHERE operation_id = $2{claim_predicate}",
+                    f"WHERE operation_id = $2{claim_fence.sql}",
                     json.dumps(counts, default=_json_default),
                     uuid.UUID(operation_id),
-                    *claim_args,
+                    *claim_fence.args,
                 )
                 _require_guarded_update(update_result, operation_id, "record import outcome for")
 
@@ -1723,16 +1723,16 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
                 if operation_id:
-                    claim_predicate, claim_args = _queue_claim_predicate(2)
+                    claim_fence = _queue_claim_predicate(2)
                     completed_row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
-                        WHERE operation_id = $1{claim_predicate}
+                        WHERE operation_id = $1{claim_fence.sql}
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
-                        *claim_args,
+                        *claim_fence.args,
                     )
                     if completed_row is None and _active_queue_claim() is not None:
                         raise OperationQueueAuthorityError(
@@ -2283,14 +2283,14 @@ class MemoryEngine(MemoryEngineInterface):
                 }
             )
             async with acquire_with_retry(backend) as conn:
-                claim_predicate, claim_args = _queue_claim_predicate(3)
+                claim_fence = _queue_claim_predicate(3)
                 result = await conn.execute(
                     f"UPDATE {fq_table('async_operations')} "
                     f"SET result_metadata = $2::jsonb, updated_at = now() "
-                    f"WHERE operation_id = $1{claim_predicate}",
+                    f"WHERE operation_id = $1{claim_fence.sql}",
                     uuid.UUID(operation_id),
                     meta,
-                    *claim_args,
+                    *claim_fence.args,
                 )
                 _require_guarded_update(result, operation_id, "record webhook delivery metadata for")
         except OperationQueueAuthorityError:
@@ -2436,14 +2436,14 @@ class MemoryEngine(MemoryEngineInterface):
         try:
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
-                claim_predicate, claim_args = _queue_claim_predicate(3)
+                claim_fence = _queue_claim_predicate(3)
                 result = await conn.execute(
                     f"UPDATE {fq_table('async_operations')} "
                     f"SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb, "
-                    f"updated_at = now() WHERE operation_id = $1{claim_predicate}",
+                    f"updated_at = now() WHERE operation_id = $1{claim_fence.sql}",
                     uuid.UUID(operation_id),
                     json.dumps({"progress": snapshot}),
-                    *claim_args,
+                    *claim_fence.args,
                 )
                 _require_guarded_update(result, operation_id, "write progress for")
         except OperationQueueAuthorityError:
@@ -2466,17 +2466,17 @@ class MemoryEngine(MemoryEngineInterface):
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
                     # Mark this operation as failed
-                    claim_predicate, claim_args = _queue_claim_predicate(3)
+                    claim_fence = _queue_claim_predicate(3)
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'failed', error_message = $2, updated_at = NOW()
-                        WHERE operation_id = $1{claim_predicate}
+                        WHERE operation_id = $1{claim_fence.sql}
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
                         truncated_error,
-                        *claim_args,
+                        *claim_fence.args,
                     )
                     if row is None:
                         if _active_queue_claim() is not None:
@@ -2512,16 +2512,16 @@ class MemoryEngine(MemoryEngineInterface):
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
                     # Mark this operation as completed
-                    claim_predicate, claim_args = _queue_claim_predicate(2)
+                    claim_fence = _queue_claim_predicate(2)
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
-                        WHERE operation_id = $1{claim_predicate}
+                        WHERE operation_id = $1{claim_fence.sql}
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
-                        *claim_args,
+                        *claim_fence.args,
                     )
                     if row is None:
                         if _active_queue_claim() is not None:
@@ -2554,12 +2554,12 @@ class MemoryEngine(MemoryEngineInterface):
         try:
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
-                select_predicate, select_args = _queue_claim_predicate(2)
+                select_fence = _queue_claim_predicate(2)
                 row = await conn.fetchrow(
                     f"SELECT result_metadata FROM {fq_table('async_operations')} "
-                    f"WHERE operation_id = $1{select_predicate}",
+                    f"WHERE operation_id = $1{select_fence.sql}",
                     uuid.UUID(operation_id),
-                    *select_args,
+                    *select_fence.args,
                 )
                 if not row:
                     if _active_queue_claim() is not None:
@@ -2577,17 +2577,17 @@ class MemoryEngine(MemoryEngineInterface):
                     extraction_errors_sample=extraction_errors.sample,
                 )
 
-                update_predicate, update_args = _queue_claim_predicate(3)
+                update_fence = _queue_claim_predicate(3)
                 result = await conn.execute(
                     f"""
                     UPDATE {fq_table("async_operations")}
                     SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb,
                         updated_at = now()
-                    WHERE operation_id = $1{update_predicate}
+                    WHERE operation_id = $1{update_fence.sql}
                     """,
                     uuid.UUID(operation_id),
                     json.dumps(outcome.to_dict()),
-                    *update_args,
+                    *update_fence.args,
                 )
                 _require_guarded_update(result, operation_id, "write retain outcome for")
         except OperationQueueAuthorityError:
@@ -2619,16 +2619,16 @@ class MemoryEngine(MemoryEngineInterface):
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
-                    claim_predicate, claim_args = _queue_claim_predicate(2)
+                    claim_fence = _queue_claim_predicate(2)
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
-                        WHERE operation_id = $1{claim_predicate}
+                        WHERE operation_id = $1{claim_fence.sql}
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
-                        *claim_args,
+                        *claim_fence.args,
                     )
                     if row is None:
                         if _active_queue_claim() is not None:

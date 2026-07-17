@@ -21,6 +21,8 @@ down_revision: str | Sequence[str] | None = "c6d7e8f9a0b1"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+_LEGACY_TERMINAL_CLAIM_TOKEN = "ffffffffffffffffffffffffffffffff"
+
 
 def _pg_schema_prefix() -> str:
     schema = context.config.get_main_option("target_schema")
@@ -29,6 +31,16 @@ def _pg_schema_prefix() -> str:
 
 def _pg_upgrade() -> None:
     op.execute(f"ALTER TABLE {_pg_schema_prefix()}async_operations ADD COLUMN IF NOT EXISTS claim_token TEXT NULL")
+    # Terminal rows owned by a pre-token worker cannot be mutated again, but
+    # parent aggregation must still be able to attest that every child passed
+    # through a worker claim.  Grandfather only worker-owned terminal rows;
+    # unclaimed batch parents intentionally keep a NULL token.
+    op.execute(
+        f"UPDATE {_pg_schema_prefix()}async_operations "
+        f"SET claim_token = '{_LEGACY_TERMINAL_CLAIM_TOKEN}' "
+        "WHERE claim_token IS NULL AND worker_id IS NOT NULL "
+        "AND status IN ('completed', 'failed', 'cancelled')"
+    )
 
 
 def _pg_downgrade() -> None:
@@ -37,6 +49,13 @@ def _pg_downgrade() -> None:
 
 def _oracle_upgrade() -> None:
     op.execute("ALTER TABLE async_operations ADD claim_token VARCHAR2(64) NULL")
+    # Keep this normalization in lockstep with PostgreSQL; see above.
+    op.execute(
+        "UPDATE async_operations "
+        f"SET claim_token = '{_LEGACY_TERMINAL_CLAIM_TOKEN}' "
+        "WHERE claim_token IS NULL AND worker_id IS NOT NULL "
+        "AND status IN ('completed', 'failed', 'cancelled')"
+    )
 
 
 def _oracle_downgrade() -> None:

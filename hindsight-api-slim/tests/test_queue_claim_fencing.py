@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from hindsight_api.engine.operation_metadata import RetainExtractionErrors
-from hindsight_api.engine.queue_claim import bind_queue_claim
+from hindsight_api.engine.queue_claim import QueueClaimPredicate, bind_queue_claim, queue_claim_predicate
 from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.retain.fact_extraction import (
     RetainContent,
@@ -27,6 +27,12 @@ from hindsight_api.worker.poller import ClaimedTask, WorkerPoller
 WORKER_ID = "worker-test"
 CLAIM_TOKEN = "claim-generation-a"
 OPERATION_ID = "00000000-0000-0000-0000-000000000076"
+
+
+def test_queue_claim_predicate_has_named_sql_and_args() -> None:
+    predicate = queue_claim_predicate(1)
+
+    assert predicate == QueueClaimPredicate(sql="", args=())
 
 
 class _ConnectionBackend:

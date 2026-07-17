@@ -56,11 +56,11 @@ async def _read_operation_metadata(pool: Any, operation_id: str, action: str) ->
     """Read recovery metadata only from the bound worker claim generation."""
 
     async with acquire_with_retry(pool) as conn:
-        claim_predicate, claim_args = queue_claim_predicate(2)
+        claim_fence = queue_claim_predicate(2)
         row = await conn.fetchrow(
-            f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1{claim_predicate}",
+            f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1{claim_fence.sql}",
             uuid.UUID(operation_id),
-            *claim_args,
+            *claim_fence.args,
         )
         require_guarded_row(row, operation_id, action)
         return row
@@ -70,7 +70,7 @@ async def _persist_operation_document_id(pool: Any, operation_id: str, document_
     """Persist one document id without allowing a stale worker to write."""
 
     async with acquire_with_retry(pool) as conn:
-        claim_predicate, claim_args = queue_claim_predicate(3)
+        claim_fence = queue_claim_predicate(3)
         result = await conn.execute(
             f"""
             UPDATE {fq_table("async_operations")}
@@ -85,11 +85,11 @@ async def _persist_operation_document_id(pool: Any, operation_id: str, document_
                 true
             ),
             updated_at = now()
-            WHERE operation_id = $2{claim_predicate}
+            WHERE operation_id = $2{claim_fence.sql}
             """,
             json.dumps([document_id]),
             uuid.UUID(operation_id),
-            *claim_args,
+            *claim_fence.args,
         )
         require_guarded_update(result, operation_id, "persist document id for")
 
@@ -103,7 +103,7 @@ async def _persist_facts_committed_checkpoint(
     """Fence the crash-recovery checkpoint to the exact worker generation."""
 
     async with acquire_with_retry(pool) as conn:
-        claim_predicate, claim_args = queue_claim_predicate(4)
+        claim_fence = queue_claim_predicate(4)
         result = await conn.execute(
             f"""
             UPDATE {fq_table("async_operations")}
@@ -118,12 +118,12 @@ async def _persist_facts_committed_checkpoint(
                 true
             ),
             updated_at = now()
-            WHERE operation_id = $3{claim_predicate}
+            WHERE operation_id = $3{claim_fence.sql}
             """,
             json.dumps({"facts_committed": True, "unit_ids_count": unit_ids_count}),
             json.dumps([document_id]),
             uuid.UUID(operation_id),
-            *claim_args,
+            *claim_fence.args,
         )
         require_guarded_update(result, operation_id, "save facts-committed checkpoint for")
 
