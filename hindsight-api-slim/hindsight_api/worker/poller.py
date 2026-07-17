@@ -43,6 +43,21 @@ class WorkerSaturationTimeoutError(RuntimeError):
     """Every worker slot remained occupied without task or stage progress."""
 
 
+class WorkerPartialClaimReleaseError(RuntimeError):
+    """Committed claims could not be released after a later schema failed."""
+
+
+def _command_row_count(result: str | None) -> int:
+    """Parse a backend's PostgreSQL-compatible command status."""
+
+    if not result:
+        return 0
+    try:
+        return int(result.rsplit(maxsplit=1)[-1])
+    except (TypeError, ValueError):
+        return 0
+
+
 def _metric_operation_label(operation_type: str | None) -> str:
     if operation_type in _RETAIN_OP_TYPES:
         return "retain"
@@ -225,6 +240,10 @@ class WorkerPoller:
 
         self._optional_routines = OptionalRoutines(self._backend)
         self._shutdown = asyncio.Event()
+        # Set while no claim can still return untracked work. Graceful
+        # shutdown waits on this boundary before inspecting active tasks.
+        self._claim_cycle_done = asyncio.Event()
+        self._claim_cycle_done.set()
         # Readiness covers both startup recovery and the live polling path.  It
         # becomes true only after recovery and one complete polling cycle, is
         # cleared immediately on a polling error, and is cleared on all exits.
@@ -480,41 +499,57 @@ class WorkerPoller:
                 else:
                     remaining_shared -= 1
 
-        # Pass 1: fairness pass — iterate only active schemas, cap at
-        # 1 claim per pool per schema.
-        for orig_idx, schema in rotated:
-            if not _has_capacity():
-                break
-
-            fair_reserved = {t: min(1, v) for t, v in remaining_reserved.items() if v > 0}
-            fair_shared = min(1, remaining_shared) if remaining_shared > 0 else 0
-            tasks = await self._claim_batch_for_schema(schema, fair_reserved, fair_shared)
-
-            _account_tasks(tasks)
-
-            if tasks:
-                last_serviced_idx = orig_idx
-                schemas_with_work.append((orig_idx, schema))
-
-            all_tasks.extend(tasks)
-
-        # Pass 2: capacity pass — fill remaining slots from schemas
-        # that had work in pass 1 only.
-        if _has_capacity() and schemas_with_work:
-            for orig_idx, schema in schemas_with_work:
+        try:
+            # Pass 1: fairness pass — iterate only active schemas, cap at
+            # 1 claim per pool per schema.
+            for orig_idx, schema in rotated:
                 if not _has_capacity():
                     break
 
-                tasks = await self._claim_batch_for_schema(
-                    schema, {t: v for t, v in remaining_reserved.items() if v > 0}, remaining_shared
-                )
+                fair_reserved = {t: min(1, v) for t, v in remaining_reserved.items() if v > 0}
+                fair_shared = min(1, remaining_shared) if remaining_shared > 0 else 0
+                tasks = await self._claim_batch_for_schema(schema, fair_reserved, fair_shared)
 
                 _account_tasks(tasks)
 
                 if tasks:
                     last_serviced_idx = orig_idx
+                    schemas_with_work.append((orig_idx, schema))
 
                 all_tasks.extend(tasks)
+
+            # Pass 2: capacity pass — fill remaining slots from schemas
+            # that had work in pass 1 only.
+            if _has_capacity() and schemas_with_work:
+                for orig_idx, schema in schemas_with_work:
+                    if not _has_capacity():
+                        break
+
+                    tasks = await self._claim_batch_for_schema(
+                        schema, {t: v for t, v in remaining_reserved.items() if v > 0}, remaining_shared
+                    )
+
+                    _account_tasks(tasks)
+
+                    if tasks:
+                        last_serviced_idx = orig_idx
+
+                    all_tasks.extend(tasks)
+        except (Exception, asyncio.CancelledError):
+            if all_tasks:
+                # Claims commit independently per tenant schema. If a later
+                # schema fails, release every earlier claim before surfacing
+                # the unavailable poll; otherwise processing rows can become
+                # invisible to this process forever.
+                try:
+                    await self._release_claimed_tasks(all_tasks)
+                except Exception as release_error:
+                    # Exit immediately so startup recovery can release the
+                    # exact-worker rows instead of restoring false readiness.
+                    raise WorkerPartialClaimReleaseError(
+                        f"Worker {self._worker_id} could not release a partial cross-schema claim batch"
+                    ) from release_error
+            raise
 
         # Advance offset past the last schema we serviced, or by 1 if
         # nothing was claimed (so we don't keep re-hitting an empty head).
@@ -537,6 +572,33 @@ class WorkerPoller:
             # restart a worker that has lost queue authority.
             schema_display = f'"{schema}"' if schema else str(schema)
             raise RuntimeError(f"Worker {self._worker_id} failed to claim tasks for schema {schema_display}") from e
+
+    async def _release_claimed_tasks(self, tasks: list[ClaimedTask]) -> None:
+        """Return partially committed claims to pending before a failed poll escapes."""
+        tasks_by_schema: dict[str | None, list[ClaimedTask]] = {}
+        for task in tasks:
+            tasks_by_schema.setdefault(task.schema, []).append(task)
+
+        for schema, schema_tasks in tasks_by_schema.items():
+            table = fq_table("async_operations", schema)
+            async with self._backend.acquire() as conn:
+                async with conn.transaction():
+                    for task in schema_tasks:
+                        result = await conn.execute(
+                            f"""
+                            UPDATE {table}
+                            SET status = 'pending', worker_id = NULL,
+                                claimed_at = NULL, updated_at = now()
+                            WHERE operation_id = $1 AND status = 'processing'
+                              AND worker_id = $2
+                            """,
+                            task.operation_id,
+                            self._worker_id,
+                        )
+                        if _command_row_count(result) != 1:
+                            raise RuntimeError(
+                                f"Worker {self._worker_id} could not release partial claim {task.operation_id}"
+                            )
 
     async def _claim_batch_for_schema_inner(
         self, schema: str | None, reserved_limits: dict[str, int], shared_limit: int
@@ -1082,59 +1144,80 @@ class WorkerPoller:
                 self._raise_if_background_task_failed()
                 await self._raise_if_saturated_without_progress()
                 try:
+                    # Close the race where shutdown is requested after the
+                    # while condition but before a new claim starts.
+                    if self._shutdown.is_set():
+                        break
                     # Claim a batch of tasks (respecting slot limits).  The
                     # worker does not become ready until the complete cycle
                     # below succeeds, proving it can actually interrogate and
                     # service its queue after startup recovery.
-                    tasks = await self.claim_batch()
-                    # A background terminal write may have failed while the
-                    # claim was in flight.  Do not spawn the returned work or
-                    # reassert readiness before observing that fatal state.
-                    self._raise_if_background_task_failed()
+                    self._claim_cycle_done.clear()
+                    try:
+                        tasks = await self.claim_batch()
+                        # A background terminal write may have failed while the
+                        # claim was in flight.  Do not spawn returned work or
+                        # reassert readiness before observing that fatal state.
+                        self._raise_if_background_task_failed()
 
-                    if tasks:
-                        # Log batch info
-                        task_types: dict[str, int] = {}
-                        schemas_seen: set[str | None] = set()
-                        consolidation_count = 0
-                        for task in tasks:
-                            t = task.task_dict.get("type", "unknown")
-                            op_type = task.task_dict.get("operation_type", "unknown")
-                            task_types[t] = task_types.get(t, 0) + 1
-                            schemas_seen.add(task.schema)
-                            if op_type == "consolidation":
-                                consolidation_count += 1
+                        if self._shutdown.is_set():
+                            # Shutdown may arrive while rows are being claimed.
+                            # Return them before declaring the cycle quiescent;
+                            # no new side effect starts after that request.
+                            if tasks:
+                                try:
+                                    await self._release_claimed_tasks(tasks)
+                                except Exception as release_error:
+                                    raise WorkerPartialClaimReleaseError(
+                                        f"Worker {self._worker_id} could not release claims during shutdown"
+                                    ) from release_error
+                            break
 
-                        types_str = ", ".join(f"{k}:{v}" for k, v in task_types.items())
-                        # Display None as "default" in logs
-                        schemas_str = ", ".join(s if s else "default" for s in schemas_seen)
-                        logger.info(
-                            f"Worker {self._worker_id} claimed {len(tasks)} tasks "
-                            f"({consolidation_count} consolidation): {types_str} (schemas: {schemas_str})"
-                        )
+                        if tasks:
+                            # Log batch info
+                            task_types: dict[str, int] = {}
+                            schemas_seen: set[str | None] = set()
+                            consolidation_count = 0
+                            for task in tasks:
+                                t = task.task_dict.get("type", "unknown")
+                                op_type = task.task_dict.get("operation_type", "unknown")
+                                task_types[t] = task_types.get(t, 0) + 1
+                                schemas_seen.add(task.schema)
+                                if op_type == "consolidation":
+                                    consolidation_count += 1
 
-                        # Spawn tasks as background jobs (fire-and-forget)
-                        for task in tasks:
-                            await self.execute_task(task)
+                            types_str = ", ".join(f"{k}:{v}" for k, v in task_types.items())
+                            # Display None as "default" in logs
+                            schemas_str = ", ".join(s if s else "default" for s in schemas_seen)
+                            logger.info(
+                                f"Worker {self._worker_id} claimed {len(tasks)} tasks "
+                                f"({consolidation_count} consolidation): {types_str} (schemas: {schemas_str})"
+                            )
+
+                            # Spawn tasks as background jobs (fire-and-forget)
+                            for task in tasks:
+                                await self.execute_task(task)
+
+                            self._raise_if_background_task_failed()
+                            self._ready = True
+                            consecutive_poll_errors = 0
+                            # Continue immediately to claim more tasks (if slots available)
+                            continue
+
+                        # Log progress stats periodically
+                        await self._log_progress_if_due()
 
                         self._raise_if_background_task_failed()
                         self._ready = True
                         consecutive_poll_errors = 0
-                        # Continue immediately to claim more tasks (if slots available)
-                        continue
 
-                    # Log progress stats periodically
-                    await self._log_progress_if_due()
+                        # No tasks claimed (either no pending tasks or slots full)
+                        # Wait before polling again
+                        await self._wait_for_poll_interval_or_stop()
+                    finally:
+                        self._claim_cycle_done.set()
 
-                    self._raise_if_background_task_failed()
-                    self._ready = True
-                    consecutive_poll_errors = 0
-
-                    # No tasks claimed (either no pending tasks or slots full)
-                    # Wait before polling again
-                    await self._wait_for_poll_interval_or_stop()
-
-                except (WorkerBackgroundTaskError, WorkerSaturationTimeoutError):
+                except (WorkerBackgroundTaskError, WorkerPartialClaimReleaseError, WorkerSaturationTimeoutError):
                     raise
                 except asyncio.CancelledError:
                     logger.info(f"Worker {self._worker_id} polling loop cancelled")
@@ -1170,8 +1253,20 @@ class WorkerPoller:
         logger.info(f"Worker {self._worker_id} initiating graceful shutdown")
         self._shutdown.set()
 
-        # Wait for in-flight tasks to complete
+        # A claim commits rows before returning them to the poll loop. Wait
+        # until that loop has registered or released the work before an
+        # apparent zero-task drain can succeed.
         start_time = asyncio.get_event_loop().time()
+        remaining = timeout - (asyncio.get_event_loop().time() - start_time)
+        if not self._claim_cycle_done.is_set():
+            try:
+                await asyncio.wait_for(self._claim_cycle_done.wait(), timeout=max(0.0, remaining))
+            except TimeoutError as timeout_error:
+                raise WorkerPartialClaimReleaseError(
+                    f"Worker {self._worker_id} claim cycle did not quiesce during shutdown"
+                ) from timeout_error
+
+        # Wait for in-flight tasks to complete.
         while asyncio.get_event_loop().time() - start_time < timeout:
             async with self._in_flight_lock:
                 in_flight = self._in_flight_count

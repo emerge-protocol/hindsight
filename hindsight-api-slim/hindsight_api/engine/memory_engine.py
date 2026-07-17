@@ -43,6 +43,7 @@ from ..tracing import create_operation_span
 from ..utils import mask_network_location
 from ..worker.exceptions import (
     DeferOperation,
+    OperationPayloadIntegrityError,
     OperationQueueAuthorityError,
     OperationTerminalStateError,
     RetryTaskAt,
@@ -1904,11 +1905,11 @@ class MemoryEngine(MemoryEngineInterface):
         payload_operation_id = task_dict.get("operation_id")
         if expected_worker_id is not None:
             if not claimed_operation_id:
-                raise OperationQueueAuthorityError(
+                raise OperationPayloadIntegrityError(
                     "Worker task is missing its database-authoritative claimed operation id"
                 )
             if payload_operation_id is not None and str(payload_operation_id) != str(claimed_operation_id):
-                raise OperationQueueAuthorityError(
+                raise OperationPayloadIntegrityError(
                     "Worker task payload operation id does not match its database-authoritative claim"
                 )
             operation_id = str(claimed_operation_id)
@@ -2001,7 +2002,7 @@ class MemoryEngine(MemoryEngineInterface):
 
                 audit_entry.response = {"status": "completed", "operation_id": operation_id}
 
-            except (UnsupportedWorkerTaskError, OperationTerminalStateError):
+            except (UnsupportedWorkerTaskError, OperationPayloadIntegrityError, OperationTerminalStateError):
                 # The poller owns the exact terminal queue transition.  Let it
                 # mark this existing row failed without retry or DELETE.
                 raise
@@ -2253,7 +2254,10 @@ class MemoryEngine(MemoryEngineInterface):
         event_type = task_dict["event_type"]
         raw_payload = task_dict["payload"]
         retry_count = task_dict.get("_retry_count", 0)
-        operation_id: str | None = task_dict.get("_operation_id")
+        # execute_task replaces the private claim field with the exact public
+        # operation_id before dispatch. Reading the private field here drops
+        # delivery metadata for every standalone-worker webhook.
+        operation_id: str | None = task_dict.get("operation_id")
         http_config = WebhookHttpConfig.model_validate(task_dict.get("http_config") or {})
 
         if isinstance(raw_payload, dict):

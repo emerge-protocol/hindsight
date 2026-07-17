@@ -15,7 +15,12 @@ from hindsight_api.config import (
 )
 from hindsight_api.engine.memory_engine import MemoryEngine, UnsupportedWorkerTaskError
 from hindsight_api.worker import main as worker_main
-from hindsight_api.worker.exceptions import OperationQueueAuthorityError, OperationTerminalStateError
+from hindsight_api.worker.exceptions import (
+    OperationPayloadIntegrityError,
+    OperationQueueAuthorityError,
+    OperationTerminalStateError,
+    RetryTaskAt,
+)
 from hindsight_api.worker.main import _wait_for_shutdown_or_worker_failure, create_worker_app
 from hindsight_api.worker.poller import (
     MAX_CONSECUTIVE_POLL_ERRORS,
@@ -23,6 +28,7 @@ from hindsight_api.worker.poller import (
     ClaimedTask,
     SlotAvailability,
     WorkerBackgroundTaskError,
+    WorkerPartialClaimReleaseError,
     WorkerPoller,
     WorkerPollingUnavailableError,
     WorkerSaturationTimeoutError,
@@ -411,7 +417,7 @@ async def test_poller_binds_missing_payload_id_to_exact_claim_before_engine_side
 
 
 @pytest.mark.asyncio
-async def test_poller_rejects_payload_id_mismatching_exact_claim_before_engine_side_effects():
+async def test_poller_marks_payload_id_mismatch_failed_without_restart_loop():
     operation_id = "00000000-0000-0000-0000-000000000094"
     claimed = await _claim_one_for_authority_test(
         {
@@ -428,14 +434,86 @@ async def test_poller_rejects_payload_id_mismatching_exact_claim_before_engine_s
         executor=memory.execute_task,
         tenant_extension=MagicMock(),
     )
+    poller._mark_failed = AsyncMock(return_value=None)
 
-    with (
-        patch("hindsight_api.worker.poller.get_metrics_collector", return_value=MagicMock()),
-        pytest.raises(OperationQueueAuthorityError, match="does not match"),
-    ):
+    with patch("hindsight_api.worker.poller.get_metrics_collector", return_value=MagicMock()):
         await poller._execute_task_inner(claimed)
 
     memory._handle_graph_maintenance.assert_not_awaited()
+    memory._mark_operation_completed.assert_not_awaited()
+    poller._mark_failed.assert_awaited_once_with(
+        operation_id,
+        "Worker task payload operation id does not match its database-authoritative claim",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_claimed_id_is_deterministic_payload_integrity_failure():
+    memory = _authority_test_memory()
+
+    with pytest.raises(OperationPayloadIntegrityError, match="missing its database-authoritative"):
+        await memory.execute_task(
+            {
+                "type": "graph_maintenance",
+                "operation_id": "00000000-0000-0000-0000-000000000092",
+                "bank_id": "bank-test",
+                "_worker_id": "worker-test",
+            }
+        )
+
+    memory._handle_graph_maintenance.assert_not_awaited()
+
+
+def _claimed_webhook_memory() -> MemoryEngine:
+    memory = _authority_test_memory()
+    memory._webhook_manager = None
+    memory._http_client = MagicMock()
+    memory._update_webhook_delivery_metadata = AsyncMock(return_value=None)
+    return memory
+
+
+def _claimed_webhook_task(operation_id: str) -> dict:
+    return {
+        "type": "webhook_delivery",
+        "operation_id": operation_id,
+        "bank_id": "bank-test",
+        "url": "https://example.com/hook",
+        "secret": None,
+        "event_type": "retain.completed",
+        "payload": {"status": "completed"},
+        "_retry_count": 0,
+        "_worker_id": "worker-test",
+        "_operation_id": operation_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_claimed_webhook_success_writes_metadata_for_authoritative_operation():
+    operation_id = "00000000-0000-0000-0000-000000000089"
+    memory = _claimed_webhook_memory()
+    response = MagicMock(status_code=204, text="accepted")
+    response.raise_for_status.return_value = None
+    memory._http_client.post = AsyncMock(return_value=response)
+
+    await memory.execute_task(_claimed_webhook_task(operation_id))
+
+    memory._update_webhook_delivery_metadata.assert_awaited_once_with(operation_id, 204, "accepted")
+    memory._mark_operation_completed.assert_awaited_once_with(operation_id)
+
+
+@pytest.mark.asyncio
+async def test_claimed_webhook_failure_writes_metadata_for_authoritative_operation():
+    operation_id = "00000000-0000-0000-0000-000000000088"
+    memory = _claimed_webhook_memory()
+    response = MagicMock(status_code=503, text="busy")
+    response.raise_for_status.side_effect = RuntimeError("upstream unavailable")
+    memory._http_client.post = AsyncMock(return_value=response)
+
+    with pytest.raises(RetryTaskAt, match="upstream unavailable"):
+        await memory.execute_task(_claimed_webhook_task(operation_id))
+
+    memory._update_webhook_delivery_metadata.assert_awaited_once_with(operation_id, 503, "busy")
     memory._mark_operation_completed.assert_not_awaited()
 
 
@@ -787,6 +865,231 @@ async def test_real_schema_scan_failure_propagates_through_claim_batch():
 
     assert isinstance(raised.value.__cause__, PermissionError)
     conn.fetchval.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partial_cross_schema_claim_failure_releases_committed_claim_before_retry():
+    poller = _poller()
+    poller._get_available_slots = AsyncMock(return_value=SlotAvailability(reserved={}, shared=2))
+    poller._get_schemas = AsyncMock(return_value=["tenant_a", "tenant_b"])
+    poller._scan_active_schemas = AsyncMock(return_value={"tenant_a", "tenant_b"})
+    operation_id = "00000000-0000-0000-0000-000000000087"
+    claimed = ClaimedTask(
+        operation_id=operation_id,
+        task_dict={"type": "graph_maintenance", "operation_type": "graph_maintenance"},
+        schema="tenant_a",
+    )
+    claim_state = "pending"
+    tenant_b_unavailable = True
+
+    async def claim_schema(schema, _reserved, _shared):
+        nonlocal claim_state
+        if schema == "tenant_a" and claim_state == "pending":
+            claim_state = "processing"
+            return [claimed]
+        if schema == "tenant_b" and tenant_b_unavailable:
+            raise PermissionError("tenant B queue unavailable")
+        return []
+
+    async def release_claims(tasks):
+        nonlocal claim_state
+        assert tasks == [claimed]
+        assert claim_state == "processing"
+        claim_state = "pending"
+
+    poller._claim_batch_for_schema_inner = AsyncMock(side_effect=claim_schema)
+    poller._release_claimed_tasks = AsyncMock(side_effect=release_claims)
+
+    with pytest.raises(RuntimeError, match='failed to claim tasks for schema "tenant_b"'):
+        await poller.claim_batch()
+
+    assert claim_state == "pending"
+    assert operation_id not in poller._active_tasks
+    poller._release_claimed_tasks.assert_awaited_once_with([claimed])
+
+    tenant_b_unavailable = False
+    tasks = await poller.claim_batch()
+    assert tasks == [claimed]
+    assert claim_state == "processing"
+
+
+@pytest.mark.asyncio
+async def test_partial_claim_release_is_fenced_to_exact_worker_and_processing_row():
+    connection = MagicMock()
+    connection.execute = AsyncMock(return_value="UPDATE 1")
+    transaction = AsyncMock()
+    transaction.__aenter__.return_value = None
+    transaction.__aexit__.return_value = False
+    connection.transaction.return_value = transaction
+    context = AsyncMock()
+    context.__aenter__.return_value = connection
+    context.__aexit__.return_value = False
+    backend = MagicMock()
+    backend.acquire.return_value = context
+    poller = WorkerPoller(
+        backend=backend,
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+    task = ClaimedTask(
+        operation_id="00000000-0000-0000-0000-000000000086",
+        task_dict={},
+        schema="tenant_a",
+    )
+
+    await poller._release_claimed_tasks([task])
+
+    sql, operation_id, worker_id = connection.execute.await_args.args
+    assert "status = 'processing'" in sql
+    assert "worker_id = $2" in sql
+    assert operation_id == task.operation_id
+    assert worker_id == "worker-test"
+
+
+@pytest.mark.asyncio
+async def test_partial_claim_release_rejects_zero_row_authority_update():
+    connection = MagicMock()
+    connection.execute = AsyncMock(return_value="UPDATE 0")
+    transaction = AsyncMock()
+    transaction.__aenter__.return_value = None
+    transaction.__aexit__.return_value = False
+    connection.transaction.return_value = transaction
+    context = AsyncMock()
+    context.__aenter__.return_value = connection
+    context.__aexit__.return_value = False
+    backend = MagicMock()
+    backend.acquire.return_value = context
+    poller = WorkerPoller(
+        backend=backend,
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+    task = ClaimedTask(
+        operation_id="00000000-0000-0000-0000-000000000080",
+        task_dict={},
+        schema="tenant_a",
+    )
+
+    with pytest.raises(RuntimeError, match="could not release partial claim"):
+        await poller._release_claimed_tasks([task])
+
+
+@pytest.mark.asyncio
+async def test_partial_claim_release_failure_exits_before_readiness_can_recover():
+    poller = _poller()
+    poller.recover_own_tasks = AsyncMock(return_value=0)
+    poller._get_available_slots = AsyncMock(return_value=SlotAvailability(reserved={}, shared=2))
+    poller._get_schemas = AsyncMock(return_value=["tenant_a", "tenant_b"])
+    poller._scan_active_schemas = AsyncMock(return_value={"tenant_a", "tenant_b"})
+    claimed = ClaimedTask(
+        operation_id="00000000-0000-0000-0000-000000000085",
+        task_dict={"type": "graph_maintenance", "operation_type": "graph_maintenance"},
+        schema="tenant_a",
+    )
+    tenant_b_calls = 0
+
+    async def claim_schema(schema, _reserved, _shared):
+        nonlocal tenant_b_calls
+        if schema == "tenant_a":
+            return [claimed]
+        tenant_b_calls += 1
+        if tenant_b_calls == 1:
+            raise PermissionError("tenant B transient failure")
+        return []
+
+    poller._claim_batch_for_schema_inner = AsyncMock(side_effect=claim_schema)
+    poller._release_claimed_tasks = AsyncMock(side_effect=PermissionError("release unavailable"))
+
+    with pytest.raises(WorkerPartialClaimReleaseError, match="partial cross-schema claim batch") as raised:
+        await poller.run()
+
+    assert isinstance(raised.value.__cause__, PermissionError)
+    assert tenant_b_calls == 1
+    assert poller.is_ready is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cross_schema_claim_releases_already_committed_rows():
+    poller = _poller()
+    poller._get_available_slots = AsyncMock(return_value=SlotAvailability(reserved={}, shared=2))
+    poller._get_schemas = AsyncMock(return_value=["tenant_a", "tenant_b"])
+    poller._scan_active_schemas = AsyncMock(return_value={"tenant_a", "tenant_b"})
+    claimed = ClaimedTask(
+        operation_id="00000000-0000-0000-0000-000000000084",
+        task_dict={"type": "graph_maintenance", "operation_type": "graph_maintenance"},
+        schema="tenant_a",
+    )
+    tenant_b_entered = asyncio.Event()
+    block_tenant_b = asyncio.Event()
+
+    async def claim_schema(schema, _reserved, _shared):
+        if schema == "tenant_a":
+            return [claimed]
+        tenant_b_entered.set()
+        await block_tenant_b.wait()
+        return []
+
+    poller._claim_batch_for_schema_inner = AsyncMock(side_effect=claim_schema)
+    poller._release_claimed_tasks = AsyncMock(return_value=None)
+
+    claim_task = asyncio.create_task(poller.claim_batch())
+    await asyncio.wait_for(tenant_b_entered.wait(), timeout=1)
+    claim_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await claim_task
+
+    poller._release_claimed_tasks.assert_awaited_once_with([claimed])
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_claim_and_releases_without_spawning_new_work():
+    poller = _poller()
+    poller.recover_own_tasks = AsyncMock(return_value=0)
+    claimed = ClaimedTask(
+        operation_id="00000000-0000-0000-0000-000000000083",
+        task_dict={"type": "graph_maintenance", "operation_type": "graph_maintenance"},
+        schema="tenant_a",
+    )
+    claim_entered = asyncio.Event()
+    release_claim = asyncio.Event()
+
+    async def controlled_claim():
+        claim_entered.set()
+        await release_claim.wait()
+        return [claimed]
+
+    poller.claim_batch = AsyncMock(side_effect=controlled_claim)
+    poller._release_claimed_tasks = AsyncMock(return_value=None)
+    poller.execute_task = AsyncMock(return_value=None)
+
+    run_task = asyncio.create_task(poller.run())
+    await asyncio.wait_for(claim_entered.wait(), timeout=1)
+    shutdown_task = asyncio.create_task(poller.shutdown_graceful(timeout=1))
+    await asyncio.sleep(0)
+    assert not shutdown_task.done()
+
+    release_claim.set()
+    await asyncio.wait_for(run_task, timeout=1)
+    await asyncio.wait_for(shutdown_task, timeout=1)
+
+    poller._release_claimed_tasks.assert_awaited_once_with([claimed])
+    poller.execute_task.assert_not_awaited()
+    assert poller._active_tasks == {}
+    assert poller._in_flight_count == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fails_closed_when_claim_cycle_cannot_quiesce():
+    poller = _poller()
+    poller._claim_cycle_done.clear()
+
+    with pytest.raises(WorkerPartialClaimReleaseError, match="claim cycle did not quiesce") as raised:
+        await poller.shutdown_graceful(timeout=0.01)
+
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert poller._shutdown.is_set()
 
 
 @pytest.mark.asyncio
