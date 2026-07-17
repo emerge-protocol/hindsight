@@ -603,7 +603,7 @@ class WorkerPoller:
                             self._worker_id,
                             task.claim_token,
                         )
-                        updated = int(result.split()[-1]) if result else 0
+                        updated = _command_row_count(result)
                         if updated != 1:
                             raise OperationQueueAuthorityError(
                                 f"Worker {self._worker_id} lost claim generation while releasing {task.operation_id}"

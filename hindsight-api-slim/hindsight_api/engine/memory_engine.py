@@ -1997,10 +1997,10 @@ class MemoryEngine(MemoryEngineInterface):
                         raise OperationQueueAuthorityError(
                             f"Queue claim generation moved before operation {operation_id} could start"
                         )
+            except OperationQueueAuthorityError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to check operation status {operation_id}: {e}")
-                if isinstance(e, OperationQueueAuthorityError):
-                    raise
                 raise OperationQueueAuthorityError(
                     f"Failed to prove runnable queue authority for operation {operation_id}"
                 ) from e

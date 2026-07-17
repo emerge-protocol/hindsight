@@ -388,7 +388,7 @@ async def test_queue_authority_read_failure_prevents_task_side_effects():
 
 
 @pytest.mark.asyncio
-async def test_same_worker_aba_preflight_prevents_task_side_effects():
+async def test_same_worker_aba_preflight_prevents_task_side_effects(caplog):
     operation_id = "00000000-0000-0000-0000-000000000082"
     memory = object.__new__(MemoryEngine)
     memory._audit_logger = None
@@ -404,6 +404,7 @@ async def test_same_worker_aba_preflight_prevents_task_side_effects():
         await memory.execute_task(_claimed_engine_task(operation_id))
 
     memory._handle_graph_maintenance.assert_not_awaited()
+    assert not any(record.levelname == "ERROR" for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -1255,6 +1256,27 @@ async def test_same_worker_aba_partial_release_update_zero_fails_closed():
     assert "claim_token = $3" in sql
     assert worker_id == "worker-test"
     assert claim_token == CLAIM_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_partial_release_malformed_command_status_fails_as_authority_loss():
+    connection = _transactional_connection()
+    connection.execute.return_value = "unexpected-status"
+    poller = WorkerPoller(
+        backend=_ConnectionBackend(connection),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+    task = ClaimedTask(
+        operation_id="00000000-0000-0000-0000-000000000076",
+        task_dict={},
+        schema=None,
+        claim_token=CLAIM_TOKEN,
+    )
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
+        await poller._release_claimed_tasks([task])
 
 
 @pytest.mark.asyncio
