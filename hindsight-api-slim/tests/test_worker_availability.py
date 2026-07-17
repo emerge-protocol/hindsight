@@ -1246,7 +1246,7 @@ async def test_partial_claim_release_is_fenced_to_exact_worker_and_processing_ro
     ],
 )
 @pytest.mark.asyncio
-async def test_same_worker_aba_poller_transition_update_zero_fails_closed(method_name, transition_args):
+async def test_extant_poller_transition_row_with_moved_claim_fails_closed(method_name, transition_args):
     connection = _transactional_connection()
     connection.execute.return_value = "UPDATE 0"
     poller = WorkerPoller(
@@ -1256,6 +1256,7 @@ async def test_same_worker_aba_poller_transition_update_zero_fails_closed(method
         tenant_extension=MagicMock(),
     )
     operation_id = "00000000-0000-0000-0000-000000000079"
+    connection.fetchval.return_value = operation_id
 
     with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
         await getattr(poller, method_name)(operation_id, *transition_args, None, CLAIM_TOKEN)
@@ -1264,6 +1265,44 @@ async def test_same_worker_aba_poller_transition_update_zero_fails_closed(method
     assert "status = 'processing'" in sql
     assert "worker_id" in sql and "claim_token" in sql
     assert args[-2:] == ["worker-test", CLAIM_TOKEN]
+
+    existence_sql, existence_operation_id = connection.fetchval.await_args.args
+    assert "SELECT operation_id" in existence_sql
+    assert "worker_id" not in existence_sql and "claim_token" not in existence_sql
+    assert existence_operation_id == operation_id
+    connection.transaction.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "transition_args"),
+    [
+        ("_mark_completed", ()),
+        ("_mark_failed", ("provider failed",)),
+        ("_schedule_retry", ("later", "provider unavailable")),
+        ("_defer_operation", ("later", "backpressure")),
+    ],
+)
+@pytest.mark.asyncio
+async def test_missing_poller_transition_row_is_supported_noop(method_name, transition_args):
+    connection = _transactional_connection()
+    connection.execute.return_value = "UPDATE 0"
+    connection.fetchval.return_value = None
+    poller = WorkerPoller(
+        backend=_ConnectionBackend(connection),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+    operation_id = "00000000-0000-0000-0000-000000000080"
+
+    await getattr(poller, method_name)(operation_id, *transition_args, None, CLAIM_TOKEN)
+
+    existence_sql, existence_operation_id = connection.fetchval.await_args.args
+    assert "SELECT operation_id" in existence_sql
+    assert "worker_id" not in existence_sql and "claim_token" not in existence_sql
+    assert existence_operation_id == operation_id
+    connection.transaction.assert_called_once_with()
+    connection.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio

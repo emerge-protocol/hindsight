@@ -671,17 +671,27 @@ class WorkerPoller:
             claim_predicate = " AND status = 'processing' AND worker_id = $2 AND claim_token = $3"
             claim_args = (self._worker_id, claim_token)
         async with self._backend.acquire() as conn:
-            result = await conn.execute(
-                f"""
-                UPDATE {table}
-                SET status = 'completed', completed_at = now(), updated_at = now()
-                WHERE operation_id = $1{claim_predicate}
-                """,
-                operation_id,
-                *claim_args,
-            )
-        if claim_token and _command_row_count(result) != 1:
-            raise OperationQueueAuthorityError(f"Lost queue claim generation while completing operation {operation_id}")
+            async with conn.transaction():
+                result = await conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'completed', completed_at = now(), updated_at = now()
+                    WHERE operation_id = $1{claim_predicate}
+                    """,
+                    operation_id,
+                    *claim_args,
+                )
+                if claim_token and _command_row_count(result) != 1:
+                    await self._raise_if_transition_row_still_exists(
+                        conn,
+                        table,
+                        operation_id,
+                        f"Lost queue claim generation while completing operation {operation_id}",
+                    )
+                    logger.info(
+                        f"Operation {operation_id} no longer exists (bank deleted), skipping poller mark-completed"
+                    )
+                    return
 
     async def _mark_failed(
         self,
@@ -713,10 +723,43 @@ class WorkerPoller:
                     *claim_args,
                 )
                 if claim_token and _command_row_count(result) != 1:
-                    raise OperationQueueAuthorityError(
-                        f"Lost queue claim generation while failing operation {operation_id}"
+                    await self._raise_if_transition_row_still_exists(
+                        conn,
+                        table,
+                        operation_id,
+                        f"Lost queue claim generation while failing operation {operation_id}",
                     )
+                    logger.info(
+                        f"Operation {operation_id} no longer exists (bank deleted), skipping poller mark-failed"
+                    )
+                    return
                 await self._maybe_update_parent_operation(operation_id, schema, conn)
+
+    async def _raise_if_transition_row_still_exists(
+        self,
+        conn,
+        table: str,
+        operation_id: str,
+        claim_loss_message: str,
+    ) -> None:
+        """Distinguish a moved claim from a bank-deletion transition no-op.
+
+        The fenced transition and this unfenced existence check share one
+        transaction.  Only a genuinely cascaded-away operation preserves the
+        supported clean cancellation; any extant row still proves that this
+        worker lost its exact claim generation.
+        """
+        try:
+            existing_operation_id = await conn.fetchval(
+                f"SELECT operation_id FROM {table} WHERE operation_id = $1",
+                operation_id,
+            )
+        except Exception as e:
+            raise OperationQueueAuthorityError(
+                f"Failed to distinguish deleted operation {operation_id} from moved queue authority"
+            ) from e
+        if existing_operation_id is not None:
+            raise OperationQueueAuthorityError(claim_loss_message)
 
     async def _maybe_update_parent_operation(self, child_operation_id: str, schema: str | None, conn) -> None:
         """If this operation is a child of a batch_retain, update the parent status when all siblings are done.
@@ -823,22 +866,28 @@ class WorkerPoller:
             claim_predicate = " AND status = 'processing' AND worker_id = $4 AND claim_token = $5"
             claim_args = (self._worker_id, claim_token)
         async with self._backend.acquire() as conn:
-            result = await conn.execute(
-                f"""
-                UPDATE {table}
-                SET status = 'pending', next_retry_at = $2, worker_id = NULL, claim_token = NULL, claimed_at = NULL,
-                    retry_count = retry_count + 1, error_message = $3, updated_at = now()
-                WHERE operation_id = $1{claim_predicate}
-                """,
-                operation_id,
-                retry_at,
-                error_message,
-                *claim_args,
-            )
-        if claim_token and _command_row_count(result) != 1:
-            raise OperationQueueAuthorityError(
-                f"Lost queue claim generation while scheduling retry for operation {operation_id}"
-            )
+            async with conn.transaction():
+                result = await conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'pending', next_retry_at = $2, worker_id = NULL, claim_token = NULL, claimed_at = NULL,
+                        retry_count = retry_count + 1, error_message = $3, updated_at = now()
+                    WHERE operation_id = $1{claim_predicate}
+                    """,
+                    operation_id,
+                    retry_at,
+                    error_message,
+                    *claim_args,
+                )
+                if claim_token and _command_row_count(result) != 1:
+                    await self._raise_if_transition_row_still_exists(
+                        conn,
+                        table,
+                        operation_id,
+                        f"Lost queue claim generation while scheduling retry for operation {operation_id}",
+                    )
+                    logger.info(f"Operation {operation_id} no longer exists (bank deleted), skipping poller retry")
+                    return
         logger.warning(f"Task {operation_id} scheduled for retry at {retry_at}: {error_message}")
 
     async def _defer_operation(
@@ -861,19 +910,27 @@ class WorkerPoller:
             claim_predicate = " AND status = 'processing' AND worker_id = $3 AND claim_token = $4"
             claim_args = (self._worker_id, claim_token)
         async with self._backend.acquire() as conn:
-            result = await conn.execute(
-                f"""
-                UPDATE {table}
-                SET status = 'pending', next_retry_at = $2, worker_id = NULL, claim_token = NULL, claimed_at = NULL,
-                    updated_at = now()
-                WHERE operation_id = $1{claim_predicate}
-                """,
-                operation_id,
-                exec_date,
-                *claim_args,
-            )
-        if claim_token and _command_row_count(result) != 1:
-            raise OperationQueueAuthorityError(f"Lost queue claim generation while deferring operation {operation_id}")
+            async with conn.transaction():
+                result = await conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'pending', next_retry_at = $2, worker_id = NULL, claim_token = NULL, claimed_at = NULL,
+                        updated_at = now()
+                    WHERE operation_id = $1{claim_predicate}
+                    """,
+                    operation_id,
+                    exec_date,
+                    *claim_args,
+                )
+                if claim_token and _command_row_count(result) != 1:
+                    await self._raise_if_transition_row_still_exists(
+                        conn,
+                        table,
+                        operation_id,
+                        f"Lost queue claim generation while deferring operation {operation_id}",
+                    )
+                    logger.info(f"Operation {operation_id} no longer exists (bank deleted), skipping poller defer")
+                    return
         logger.info(f"Task {operation_id} deferred until {exec_date}: {reason}")
 
     async def execute_task(self, task: ClaimedTask):
