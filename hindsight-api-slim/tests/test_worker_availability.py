@@ -283,6 +283,7 @@ class _ConnectionBackend:
 def _transactional_connection() -> MagicMock:
     connection = MagicMock()
     connection.fetchrow = AsyncMock()
+    connection.fetchval = AsyncMock()
     connection.fetch = AsyncMock()
     connection.execute = AsyncMock()
     transaction = AsyncMock()
@@ -415,6 +416,7 @@ async def test_same_worker_aba_terminal_update_zero_fails_closed_after_handler()
         {"status": "processing", "worker_id": "worker-test", "claim_token": CLAIM_TOKEN},
         None,
     ]
+    connection.fetchval.return_value = operation_id
     memory = object.__new__(MemoryEngine)
     memory._audit_logger = None
     memory._ext_ctx = MagicMock()
@@ -431,6 +433,9 @@ async def test_same_worker_aba_terminal_update_zero_fails_closed_after_handler()
     assert "claim_token = $3" in terminal_sql
     assert worker_id == "worker-test"
     assert claim_token == CLAIM_TOKEN
+    existence_sql, existing_operation_id = connection.fetchval.await_args.args
+    assert "SELECT operation_id" in existence_sql
+    assert str(existing_operation_id) == operation_id
 
 
 @pytest.mark.asyncio

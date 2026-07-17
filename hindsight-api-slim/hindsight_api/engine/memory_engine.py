@@ -2459,6 +2459,33 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception as e:
             logger.debug(f"Failed to write operation progress for {operation_id}: {e}")
 
+    async def _raise_if_terminal_row_still_exists(
+        self,
+        conn: Any,
+        operation_id: str,
+        claim_loss_message: str,
+    ) -> None:
+        """Distinguish a moved claim from a bank-deletion terminal no-op.
+
+        A zero-row fenced terminal update is ambiguous: a successor may own the
+        operation, or the bank delete may have cascaded the operation away.  The
+        unfenced existence check runs in the same transaction so only a genuinely
+        absent row keeps the historical clean-cancellation behavior.
+        """
+        if _active_queue_claim() is None:
+            return
+        try:
+            existing_operation_id = await conn.fetchval(
+                f"SELECT operation_id FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                uuid.UUID(operation_id),
+            )
+        except Exception as e:
+            raise OperationQueueAuthorityError(
+                f"Failed to distinguish deleted operation {operation_id} from moved queue authority"
+            ) from e
+        if existing_operation_id is not None:
+            raise OperationQueueAuthorityError(claim_loss_message)
+
     async def _mark_operation_failed(self, operation_id: str, error_message: str, error_traceback: str):
         """Helper to mark an operation as failed in the database.
 
@@ -2487,10 +2514,11 @@ class MemoryEngine(MemoryEngineInterface):
                         *claim_fence.args,
                     )
                     if row is None:
-                        if _active_queue_claim() is not None:
-                            raise OperationQueueAuthorityError(
-                                f"Lost queue claim generation while marking operation {operation_id} failed"
-                            )
+                        await self._raise_if_terminal_row_still_exists(
+                            conn,
+                            operation_id,
+                            f"Lost queue claim generation while marking operation {operation_id} failed",
+                        )
                         logger.info(f"Operation {operation_id} no longer exists (bank deleted), skipping mark-failed")
                         return
                     logger.info(f"Marked async operation as failed: {operation_id}")
@@ -2532,10 +2560,11 @@ class MemoryEngine(MemoryEngineInterface):
                         *claim_fence.args,
                     )
                     if row is None:
-                        if _active_queue_claim() is not None:
-                            raise OperationQueueAuthorityError(
-                                f"Lost queue claim generation while marking operation {operation_id} completed"
-                            )
+                        await self._raise_if_terminal_row_still_exists(
+                            conn,
+                            operation_id,
+                            f"Lost queue claim generation while marking operation {operation_id} completed",
+                        )
                         logger.info(
                             f"Operation {operation_id} no longer exists (bank deleted), skipping mark-completed"
                         )
@@ -2639,10 +2668,11 @@ class MemoryEngine(MemoryEngineInterface):
                         *claim_fence.args,
                     )
                     if row is None:
-                        if _active_queue_claim() is not None:
-                            raise OperationQueueAuthorityError(
-                                f"Lost queue claim generation while completing consolidation {operation_id}"
-                            )
+                        await self._raise_if_terminal_row_still_exists(
+                            conn,
+                            operation_id,
+                            f"Lost queue claim generation while completing consolidation {operation_id}",
+                        )
                         logger.info(
                             f"Operation {operation_id} no longer exists (bank deleted), skipping mark-completed"
                         )

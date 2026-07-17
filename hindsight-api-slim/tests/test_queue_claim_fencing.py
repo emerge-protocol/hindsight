@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.operation_metadata import RetainExtractionErrors
 from hindsight_api.engine.queue_claim import QueueClaimPredicate, bind_queue_claim, queue_claim_predicate
 from hindsight_api.engine.response_models import TokenUsage
@@ -54,6 +55,63 @@ async def _under_claim(action: Callable[[], Awaitable[object]]) -> object:
         return await action()
 
     return await invoke({"_worker_id": WORKER_ID, "_claim_token": CLAIM_TOKEN})
+
+
+def _terminal_memory(connection: MagicMock) -> MemoryEngine:
+    transaction = AsyncMock()
+    transaction.__aenter__.return_value = None
+    transaction.__aexit__.return_value = False
+    connection.transaction.return_value = transaction
+    memory = object.__new__(MemoryEngine)
+    memory._get_backend = AsyncMock(return_value=_ConnectionBackend(connection))
+    memory._maybe_update_parent_operation = AsyncMock(return_value=None)
+    memory._webhook_manager = None
+    return memory
+
+
+async def _write_terminal_state(memory: MemoryEngine, terminal_path: str) -> None:
+    if terminal_path == "completed":
+        await memory._mark_operation_completed(OPERATION_ID)
+    elif terminal_path == "failed":
+        await memory._mark_operation_failed(OPERATION_ID, "provider failed", "traceback")
+    else:
+        await memory._mark_operation_completed_and_fire_webhook(
+            operation_id=OPERATION_ID,
+            bank_id="bank-test",
+            status="completed",
+            result=None,
+        )
+
+
+@pytest.mark.parametrize("terminal_path", ["completed", "failed", "consolidation"])
+@pytest.mark.asyncio
+async def test_missing_worker_owned_terminal_row_is_supported_noop(terminal_path: str) -> None:
+    connection = MagicMock()
+    connection.fetchrow = AsyncMock(return_value=None)
+    connection.fetchval = AsyncMock(return_value=None)
+    memory = _terminal_memory(connection)
+
+    await _under_claim(lambda: _write_terminal_state(memory, terminal_path))
+
+    existence_sql, operation_id = connection.fetchval.await_args.args
+    assert "SELECT operation_id" in existence_sql
+    assert "worker_id" not in existence_sql and "claim_token" not in existence_sql
+    assert str(operation_id) == OPERATION_ID
+    memory._maybe_update_parent_operation.assert_not_awaited()
+
+
+@pytest.mark.parametrize("terminal_path", ["completed", "failed", "consolidation"])
+@pytest.mark.asyncio
+async def test_extant_terminal_row_with_moved_claim_fails_closed(terminal_path: str) -> None:
+    connection = MagicMock()
+    connection.fetchrow = AsyncMock(return_value=None)
+    connection.fetchval = AsyncMock(return_value=OPERATION_ID)
+    memory = _terminal_memory(connection)
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
+        await _under_claim(lambda: _write_terminal_state(memory, terminal_path))
+
+    memory._maybe_update_parent_operation.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
