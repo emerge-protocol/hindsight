@@ -1039,6 +1039,11 @@ class WorkerPoller:
             await self._executor(task.task_dict)
             logger.debug(f"Task {task.operation_id} execution finished")
             terminal_success = True
+        except OperationQueueAuthorityError:
+            # Queue ownership is uncertain or has moved. Never translate that
+            # into a terminal failure write, even though this currently also
+            # inherits OperationTerminalStateError.
+            raise
         except OperationTerminalStateError:
             # The task may already have completed its external side effects.
             # Do not rewrite this as an ordinary task failure or retry; fail
