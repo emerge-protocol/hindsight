@@ -598,6 +598,7 @@ ENV_WORKER_MAX_RETRIES = "HINDSIGHT_API_WORKER_MAX_RETRIES"
 ENV_WORKER_TASK_RETRY_BACKOFF_SECONDS = "HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS"
 ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
+ENV_WORKER_SATURATION_TIMEOUT_SECONDS = "HINDSIGHT_API_WORKER_SATURATION_TIMEOUT_SECONDS"
 
 # Per-operation-type slot reservations. Each entry maps an operation_type
 # (as stored in async_operations.operation_type) to its env var and default.
@@ -1050,6 +1051,12 @@ DEFAULT_WORKER_MAX_RETRIES = 3  # Max retries before marking task failed
 DEFAULT_WORKER_TASK_RETRY_BACKOFF_SECONDS = 60  # Seconds between retries on transient task failure
 DEFAULT_WORKER_HTTP_PORT = 8889  # HTTP port for worker metrics/health
 DEFAULT_WORKER_MAX_SLOTS = 10  # Total concurrent tasks per worker
+# A fully occupied worker must show task/stage progress inside this window.
+# Five minutes is already the first stuck-stack threshold; three thresholds
+# leave room for legitimate provider/DB calls while still bounding a wedged
+# worker that would otherwise report healthy forever.
+DEFAULT_WORKER_SATURATION_TIMEOUT_SECONDS = 15 * 60
+MIN_WORKER_SATURATION_TIMEOUT_SECONDS = 5 * 60
 DEFAULT_RETAIN_MAX_CONCURRENT = 4  # Max concurrent retain DB phases (HNSW reads + writes). Limits I/O contention.
 
 # Reflect agent settings
@@ -1906,6 +1913,7 @@ class HindsightConfig:
     worker_task_retry_backoff_seconds: int
     worker_http_port: int
     worker_max_slots: int
+    worker_saturation_timeout_seconds: int
     worker_slot_reservations: dict[str, int]
     worker_consolidation_bank_priority: dict[str, int]
     retain_max_concurrent: int
@@ -2271,6 +2279,12 @@ class HindsightConfig:
                 f"Sum of per-operation slot reservations ({total_reserved}: {reservation_details}) "
                 f"exceeds worker_max_slots ({self.worker_max_slots}). "
                 f"Reduce reservations or increase HINDSIGHT_API_WORKER_MAX_SLOTS."
+            )
+        if self.worker_saturation_timeout_seconds < MIN_WORKER_SATURATION_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"{ENV_WORKER_SATURATION_TIMEOUT_SECONDS} must be at least "
+                f"{MIN_WORKER_SATURATION_TIMEOUT_SECONDS} seconds so legitimate long-running tasks "
+                "cross the first stuck-stack diagnostic boundary before recovery"
             )
 
     @classmethod
@@ -2921,6 +2935,12 @@ class HindsightConfig:
             ),
             worker_http_port=int(os.getenv(ENV_WORKER_HTTP_PORT, str(DEFAULT_WORKER_HTTP_PORT))),
             worker_max_slots=int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS))),
+            worker_saturation_timeout_seconds=int(
+                os.getenv(
+                    ENV_WORKER_SATURATION_TIMEOUT_SECONDS,
+                    str(DEFAULT_WORKER_SATURATION_TIMEOUT_SECONDS),
+                )
+            ),
             worker_slot_reservations={
                 op_type: int(os.getenv(env_var, str(default)))
                 for op_type, (env_var, default) in WORKER_SLOT_RESERVATION_TYPES.items()

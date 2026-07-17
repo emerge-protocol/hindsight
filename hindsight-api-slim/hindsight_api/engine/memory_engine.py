@@ -41,7 +41,13 @@ from ..config import (
 )
 from ..tracing import create_operation_span
 from ..utils import mask_network_location
-from ..worker.exceptions import DeferOperation, RetryTaskAt
+from ..worker.exceptions import (
+    DeferOperation,
+    OperationPayloadIntegrityError,
+    OperationQueueAuthorityError,
+    OperationTerminalStateError,
+    RetryTaskAt,
+)
 from ..worker.stage import set_stage
 from .audit import AuditLogger, audit_context
 from .bank_stats_cache import BankStatsCache, DistributedBankStatsCache
@@ -278,6 +284,16 @@ class MentalModelRefreshError(Exception):
     """
 
     pass
+
+
+class UnsupportedWorkerTaskError(ValueError):
+    """Raised when a queued payload names no executable worker task type.
+
+    This must escape to ``WorkerPoller`` so its narrow queue-update authority
+    marks the existing operation failed.  Deleting the row would both erase the
+    audit trail and require a DELETE grant the standalone worker intentionally
+    does not hold.
+    """
 
 
 def validate_sql_schema(sql: str) -> None:
@@ -1884,7 +1900,24 @@ class MemoryEngine(MemoryEngineInterface):
                       Example: {'type': 'batch_retain', 'bank_id': '...', 'contents': [...]}
         """
         task_type = task_dict.get("type")
-        operation_id = task_dict.get("operation_id")
+        expected_worker_id = task_dict.pop("_worker_id", None)
+        claimed_operation_id = task_dict.pop("_operation_id", None)
+        payload_operation_id = task_dict.get("operation_id")
+        if expected_worker_id is not None:
+            if not claimed_operation_id:
+                raise OperationPayloadIntegrityError(
+                    "Worker task is missing its database-authoritative claimed operation id"
+                )
+            if payload_operation_id is not None and str(payload_operation_id) != str(claimed_operation_id):
+                raise OperationPayloadIntegrityError(
+                    "Worker task payload operation id does not match its database-authoritative claim"
+                )
+            operation_id = str(claimed_operation_id)
+            # Handlers and terminal helpers consume the public key. Replace a
+            # missing value with the DB-authoritative row id, never vice versa.
+            task_dict["operation_id"] = operation_id
+        else:
+            operation_id = payload_operation_id
 
         # Set schema context for multi-tenant task execution
         schema = task_dict.pop("_schema", None)
@@ -1892,22 +1925,39 @@ class MemoryEngine(MemoryEngineInterface):
             _current_schema.set(schema)
             self._ext_ctx.current_schema = schema
 
-        # Check if operation was cancelled (only for tasks with operation_id)
+        # Prove queue authority before any provider or storage side effect. A
+        # standalone poller supplies its worker id, so horizontally scaled
+        # workers also prove that the processing claim still belongs to this
+        # process. Direct/internal callers without a worker id retain the
+        # legacy status-only check.
         if operation_id:
             try:
                 backend = await self._get_backend()
                 async with acquire_with_retry(backend) as conn:
                     result = await conn.fetchrow(
-                        f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                        f"SELECT status, worker_id FROM {fq_table('async_operations')} WHERE operation_id = $1",
                         uuid.UUID(operation_id),
                     )
                     if not result or result["status"] == "cancelled":
-                        # Operation was cancelled, skip processing
-                        logger.info(f"Skipping cancelled operation: {operation_id}")
+                        logger.info(f"Skipping cancelled or deleted operation: {operation_id}")
+                        return
+                    if expected_worker_id is not None and (
+                        result["status"] != "processing" or result["worker_id"] != expected_worker_id
+                    ):
+                        logger.warning(
+                            "Skipping operation %s because queue authority moved "
+                            "(expected_worker=%s, status=%s, actual_worker=%s)",
+                            operation_id,
+                            expected_worker_id,
+                            result["status"],
+                            result["worker_id"],
+                        )
                         return
             except Exception as e:
                 logger.error(f"Failed to check operation status {operation_id}: {e}")
-                # Continue with processing if we can't check status
+                raise OperationQueueAuthorityError(
+                    f"Failed to prove runnable queue authority for operation {operation_id}"
+                ) from e
 
         consolidation_result: dict | None = None
         bank_id = task_dict.get("bank_id")
@@ -1933,11 +1983,7 @@ class MemoryEngine(MemoryEngineInterface):
                 elif task_type == "webhook_delivery":
                     await self._handle_webhook_delivery(task_dict)
                 else:
-                    logger.error(f"Unknown task type: {task_type}")
-                    # Don't retry unknown task types
-                    if operation_id:
-                        await self._delete_operation_record(operation_id)
-                    return
+                    raise UnsupportedWorkerTaskError(f"Unknown task type: {task_type}")
 
                 # Task succeeded - mark operation as completed
                 # file_convert_retain marks itself as completed in a transaction, skip double-marking
@@ -1956,6 +2002,10 @@ class MemoryEngine(MemoryEngineInterface):
 
                 audit_entry.response = {"status": "completed", "operation_id": operation_id}
 
+            except (UnsupportedWorkerTaskError, OperationPayloadIntegrityError, OperationTerminalStateError):
+                # The poller owns the exact terminal queue transition.  Let it
+                # mark this existing row failed without retry or DELETE.
+                raise
             except ProviderRateLimitResetError as e:
                 logger.warning(f"Task deferred until provider quota resets at {e.retry_at}: {e}")
                 raise DeferOperation(exec_date=e.retry_at, reason=str(e)) from e
@@ -2204,7 +2254,10 @@ class MemoryEngine(MemoryEngineInterface):
         event_type = task_dict["event_type"]
         raw_payload = task_dict["payload"]
         retry_count = task_dict.get("_retry_count", 0)
-        operation_id: str | None = task_dict.get("_operation_id")
+        # execute_task replaces the private claim field with the exact public
+        # operation_id before dispatch. Reading the private field here drops
+        # delivery metadata for every standalone-worker webhook.
+        operation_id: str | None = task_dict.get("operation_id")
         http_config = WebhookHttpConfig.model_validate(task_dict.get("http_config") or {})
 
         if isinstance(raw_payload, dict):
@@ -2256,17 +2309,6 @@ class MemoryEngine(MemoryEngineInterface):
             )
             raise RetryTaskAt(retry_at=retry_at, message=str(e))
 
-    async def _delete_operation_record(self, operation_id: str):
-        """Helper to delete an operation record from the database."""
-        try:
-            backend = await self._get_backend()
-            async with acquire_with_retry(backend) as conn:
-                await conn.execute(
-                    f"DELETE FROM {fq_table('async_operations')} WHERE operation_id = $1", uuid.UUID(operation_id)
-                )
-        except Exception as e:
-            logger.error(f"Failed to delete async operation record {operation_id}: {e}")
-
     async def _check_op_alive(self, operation_id: str) -> bool:
         """Return False if the operation was cancelled or no longer exists (e.g. bank deleted via CASCADE).
 
@@ -2283,7 +2325,7 @@ class MemoryEngine(MemoryEngineInterface):
                 return row is not None and row["status"] != "cancelled"
         except Exception as e:
             logger.error(f"Failed to check operation liveness {operation_id}: {e}")
-            return True  # Assume alive on DB error to avoid false-positive aborts
+            raise OperationQueueAuthorityError(f"Failed to prove queue liveness for operation {operation_id}") from e
 
     async def _write_operation_progress(
         self,
@@ -2363,6 +2405,12 @@ class MemoryEngine(MemoryEngineInterface):
                     await self._maybe_update_parent_operation(operation_id, conn)
         except Exception as e:
             logger.error(f"Failed to mark operation as failed {operation_id}: {e}")
+            # Worker execution cannot report success while its authoritative
+            # terminal state remains `processing`.  Let the poller fail closed
+            # and its supervisor restart/recover the claim.
+            raise OperationTerminalStateError(
+                f"Failed to persist failed terminal state for operation {operation_id}"
+            ) from e
 
     async def _mark_operation_completed(self, operation_id: str):
         """Helper to mark an operation as completed in the database.
@@ -2396,6 +2444,9 @@ class MemoryEngine(MemoryEngineInterface):
                     await self._maybe_update_parent_operation(operation_id, conn)
         except Exception as e:
             logger.error(f"Failed to mark operation as completed {operation_id}: {e}")
+            raise OperationTerminalStateError(
+                f"Failed to persist completed terminal state for operation {operation_id}"
+            ) from e
 
     async def _write_retain_outcome_metadata(self, operation_id: str | None, unit_ids: list[list[str]]) -> None:
         """Persist completed retain outcome fields before the operation is marked completed."""
@@ -2495,6 +2546,9 @@ class MemoryEngine(MemoryEngineInterface):
                         await self._webhook_manager.fire_event_with_conn(event, conn, schema=schema)
         except Exception as e:
             logger.error(f"Failed to mark operation completed and fire webhook {operation_id}: {e}")
+            raise OperationTerminalStateError(
+                f"Failed to persist consolidation terminal state for operation {operation_id}"
+            ) from e
 
     async def _maybe_update_parent_operation(self, child_operation_id: str, conn):
         """Check if this is a child operation and update parent status if all siblings are done.

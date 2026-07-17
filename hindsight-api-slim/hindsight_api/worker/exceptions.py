@@ -28,3 +28,15 @@ class DeferOperation(Exception):
         self.exec_date = exec_date
         self.reason = reason
         super().__init__(reason)
+
+
+class OperationTerminalStateError(RuntimeError):
+    """A task could not persist its authoritative terminal queue state."""
+
+
+class OperationPayloadIntegrityError(RuntimeError):
+    """A claimed task payload contradicts its database-authoritative row."""
+
+
+class OperationQueueAuthorityError(OperationTerminalStateError):
+    """A task could not prove that it still owns runnable queue work."""
