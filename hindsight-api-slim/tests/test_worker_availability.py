@@ -721,6 +721,7 @@ async def test_claimed_webhook_integrates_authoritative_id_with_fenced_metadata_
     connection = _transactional_connection()
     connection.fetchrow.side_effect = [
         {"status": "processing", "worker_id": "worker-test", "claim_token": CLAIM_TOKEN},
+        {"status": "processing", "worker_id": "worker-test", "claim_token": CLAIM_TOKEN},
         {"operation_id": operation_id},
     ]
     connection.execute.return_value = "UPDATE 1"
@@ -744,13 +745,42 @@ async def test_claimed_webhook_integrates_authoritative_id_with_fenced_metadata_
     assert worker_id == "worker-test"
     assert claim_token == CLAIM_TOKEN
 
-    terminal_sql, _operation_id, worker_id, claim_token = connection.fetchrow.await_args_list[1].args
+    terminal_sql, _operation_id, worker_id, claim_token = connection.fetchrow.await_args_list[2].args
     assert "status = 'processing'" in terminal_sql
     assert "worker_id = $2" in terminal_sql
     assert "claim_token = $3" in terminal_sql
     assert worker_id == "worker-test"
     assert claim_token == CLAIM_TOKEN
     memory._maybe_update_parent_operation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_claimed_webhook_rechecks_claim_immediately_before_http_side_effect():
+    operation_id = "00000000-0000-0000-0000-000000000077"
+    connection = _transactional_connection()
+    connection.fetchrow.side_effect = [
+        {"status": "processing", "worker_id": "worker-test", "claim_token": CLAIM_TOKEN},
+        {
+            "status": "processing",
+            "worker_id": "worker-test",
+            "claim_token": "ffffffffffffffffffffffffffffffff",
+        },
+    ]
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(return_value=_ConnectionBackend(connection))
+    memory._webhook_manager = None
+    memory._http_client = MagicMock()
+    memory._http_client.post = AsyncMock()
+    memory._update_webhook_delivery_metadata = AsyncMock(return_value=None)
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation moved"):
+        await memory.execute_task(_claimed_webhook_task(operation_id))
+
+    memory._http_client.post.assert_not_awaited()
+    memory._update_webhook_delivery_metadata.assert_not_awaited()
+    assert connection.fetchrow.await_count == 2
 
 
 @pytest.mark.asyncio

@@ -2342,6 +2342,14 @@ class MemoryEngine(MemoryEngineInterface):
                 "params": http_config.params if http_config.params else None,
                 "timeout": http_config.timeout_seconds,
             }
+            # The task-level preflight can become stale while headers and the
+            # request body are prepared.  Re-attest the exact claim generation
+            # at the last await boundary before the irreversible HTTP side
+            # effect, then retain the fenced metadata/terminal writes below.
+            if operation_id and not await self._check_op_alive(operation_id):
+                raise OperationQueueAuthorityError(
+                    f"Webhook delivery lost runnable queue authority for operation {operation_id}"
+                )
             if http_config.method.upper() == "GET":
                 response = await self._http_client.get(url, **request_kwargs)
             else:
