@@ -280,6 +280,16 @@ class MentalModelRefreshError(Exception):
     pass
 
 
+class UnsupportedWorkerTaskError(ValueError):
+    """Raised when a queued payload names no executable worker task type.
+
+    This must escape to ``WorkerPoller`` so its narrow queue-update authority
+    marks the existing operation failed.  Deleting the row would both erase the
+    audit trail and require a DELETE grant the standalone worker intentionally
+    does not hold.
+    """
+
+
 def validate_sql_schema(sql: str) -> None:
     """
     Validate that SQL doesn't contain unqualified table references.
@@ -1933,11 +1943,7 @@ class MemoryEngine(MemoryEngineInterface):
                 elif task_type == "webhook_delivery":
                     await self._handle_webhook_delivery(task_dict)
                 else:
-                    logger.error(f"Unknown task type: {task_type}")
-                    # Don't retry unknown task types
-                    if operation_id:
-                        await self._delete_operation_record(operation_id)
-                    return
+                    raise UnsupportedWorkerTaskError(f"Unknown task type: {task_type}")
 
                 # Task succeeded - mark operation as completed
                 # file_convert_retain marks itself as completed in a transaction, skip double-marking
@@ -1956,6 +1962,10 @@ class MemoryEngine(MemoryEngineInterface):
 
                 audit_entry.response = {"status": "completed", "operation_id": operation_id}
 
+            except UnsupportedWorkerTaskError:
+                # The poller owns the exact terminal queue transition.  Let it
+                # mark this existing row failed without retry or DELETE.
+                raise
             except ProviderRateLimitResetError as e:
                 logger.warning(f"Task deferred until provider quota resets at {e.retry_at}: {e}")
                 raise DeferOperation(exec_date=e.retry_at, reason=str(e)) from e
@@ -2255,17 +2265,6 @@ class MemoryEngine(MemoryEngineInterface):
                 f"status_code={status_code} retry_in={delay}s error={e}"
             )
             raise RetryTaskAt(retry_at=retry_at, message=str(e))
-
-    async def _delete_operation_record(self, operation_id: str):
-        """Helper to delete an operation record from the database."""
-        try:
-            backend = await self._get_backend()
-            async with acquire_with_retry(backend) as conn:
-                await conn.execute(
-                    f"DELETE FROM {fq_table('async_operations')} WHERE operation_id = $1", uuid.UUID(operation_id)
-                )
-        except Exception as e:
-            logger.error(f"Failed to delete async operation record {operation_id}: {e}")
 
     async def _check_op_alive(self, operation_id: str) -> bool:
         """Return False if the operation was cancelled or no longer exists (e.g. bank deleted via CASCADE).

@@ -31,6 +31,14 @@ from .stage import StageHolder, bind_holder
 _RETAIN_OP_TYPES = {"retain", "batch_retain", "file_convert_retain"}
 
 
+class WorkerBackgroundTaskError(RuntimeError):
+    """A claimed task could not persist its next authoritative queue state."""
+
+
+class WorkerPollingUnavailableError(RuntimeError):
+    """The worker could not complete a bounded number of polling cycles."""
+
+
 def _metric_operation_label(operation_type: str | None) -> str:
     if operation_type in _RETAIN_OP_TYPES:
         return "retain"
@@ -45,6 +53,12 @@ logger = logging.getLogger(__name__)
 
 # Progress logging interval in seconds
 PROGRESS_LOG_INTERVAL = 30
+
+# A worker that cannot interrogate its queue is not available.  A short bounded
+# retry window absorbs transient database failovers; after that the process
+# exits so the service manager can restart it instead of serving green health
+# forever while doing no work.
+MAX_CONSECUTIVE_POLL_ERRORS = 3
 
 # Stuck-task stack-dump thresholds (seconds). Each task gets one stack dump
 # per threshold it crosses (5min, 10min, 20min, 40min, 80min...).
@@ -197,6 +211,12 @@ class WorkerPoller:
 
         self._optional_routines = OptionalRoutines(self._backend)
         self._shutdown = asyncio.Event()
+        # Readiness covers both startup recovery and the live polling path.  It
+        # becomes true only after recovery and one complete polling cycle, is
+        # cleared immediately on a polling error, and is cleared on all exits.
+        self._ready = False
+        self._fatal_task_error: BaseException | None = None
+        self._fatal_task_event = asyncio.Event()
         self._current_tasks: set[asyncio.Task] = set()
         self._in_flight_count = 0
         self._in_flight_lock = asyncio.Lock()
@@ -690,8 +710,39 @@ class WorkerPoller:
             self._in_flight_count += 1
             self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
 
-        # Add cleanup callback
-        bg_task.add_done_callback(lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type)))
+        # Consume every background result.  If executor failure handling cannot
+        # persist failed/pending/deferred state, fail the poller so the process
+        # supervisor and systemd recovery can release the stuck claim.
+        bg_task.add_done_callback(
+            lambda completed: self._on_background_task_done(task.operation_id, operation_type, completed)
+        )
+
+    def _on_background_task_done(
+        self,
+        operation_id: str,
+        operation_type: str,
+        task: asyncio.Task,
+    ) -> None:
+        failure: BaseException | None = None
+        if task.cancelled():
+            if not self._shutdown.is_set():
+                failure = RuntimeError(f"Background task {operation_id} was cancelled unexpectedly")
+        else:
+            try:
+                failure = task.exception()
+            except asyncio.CancelledError:
+                if not self._shutdown.is_set():
+                    failure = RuntimeError(f"Background task {operation_id} was cancelled unexpectedly")
+
+        if failure is not None and self._fatal_task_error is None:
+            self._fatal_task_error = failure
+            self._fatal_task_event.set()
+            logger.critical(
+                f"Worker {self._worker_id} background task {operation_id} could not persist terminal queue state",
+                exc_info=(type(failure), failure, failure.__traceback__),
+            )
+
+        asyncio.create_task(self._cleanup_task(operation_id, operation_type))
 
     async def _cleanup_task(self, operation_id: str, operation_type: str):
         """Remove task from tracking after completion."""
@@ -704,6 +755,34 @@ class WorkerPoller:
                     self._in_flight_by_type[operation_type] = count - 1
                     if self._in_flight_by_type[operation_type] == 0:
                         del self._in_flight_by_type[operation_type]
+
+    def _raise_if_background_task_failed(self) -> None:
+        if self._fatal_task_error is None:
+            return
+        raise WorkerBackgroundTaskError(
+            f"Worker {self._worker_id} background task could not persist authoritative queue state"
+        ) from self._fatal_task_error
+
+    async def _wait_for_poll_interval_or_stop(self) -> None:
+        """Wait for the poll interval, shutdown, or fatal task persistence."""
+        shutdown_wait = asyncio.create_task(self._shutdown.wait())
+        fatal_wait = asyncio.create_task(self._fatal_task_event.wait())
+        try:
+            await asyncio.wait(
+                {shutdown_wait, fatal_wait},
+                timeout=self._poll_interval_ms / 1000,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (shutdown_wait, fatal_wait):
+                if not task.done():
+                    task.cancel()
+            for task in (shutdown_wait, fatal_wait):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._raise_if_background_task_failed()
 
     async def _execute_task_inner(self, task: ClaimedTask, holder: StageHolder | None = None):
         """Inner task execution with retry/fail handling.
@@ -792,34 +871,41 @@ class WorkerPoller:
 
         for schema in schemas:
             try:
-                table = fq_table("async_operations", schema)
-
-                # First, recover batch API operations (before resetting worker tasks)
-                batch_count = await self._recover_batch_operations(schema)
-                total_count += batch_count
-
-                # Then reset normal worker tasks
-                async with self._backend.acquire() as conn:
-                    result = await conn.execute(
-                        f"""
-                        UPDATE {table}
-                        SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-                        WHERE status = 'processing' AND worker_id = $1 AND result_metadata->>'batch_id' IS NULL
-                        """,
-                        self._worker_id,
-                    )
-
-                # Parse "UPDATE N" to get count
-                count = int(result.split()[-1]) if result else 0
-                total_count += count
+                total_count += await self._recover_schema_tasks(schema)
             except Exception as e:
-                # Format schema for logging: custom schemas in quotes, None as-is
+                # Recovery is a readiness gate.  A partial per-schema pass is
+                # unsafe because processing rows may remain pinned to this
+                # worker while its health endpoint reports ready.  Propagate so
+                # the supervised process fails and systemd retries the complete,
+                # idempotent recovery sequence.
                 schema_display = f'"{schema}"' if schema else str(schema)
-                logger.warning(f"Worker {self._worker_id} failed to recover tasks for schema {schema_display}: {e}")
+                raise RuntimeError(
+                    f"Worker {self._worker_id} failed startup recovery for schema {schema_display}"
+                ) from e
 
         if total_count > 0:
             logger.info(f"Worker {self._worker_id} recovered {total_count} stale tasks from previous run")
         return total_count
+
+    async def _recover_schema_tasks(self, schema: str | None) -> int:
+        """Recover one schema atomically from the startup gate's perspective."""
+        table = fq_table("async_operations", schema)
+
+        # First recover batch API operations, then ordinary tasks.  Both paths
+        # must succeed before this schema counts as recovered.
+        recovered = await self._recover_batch_operations(schema)
+        async with self._backend.acquire() as conn:
+            result = await conn.execute(
+                f"""
+                UPDATE {table}
+                SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
+                WHERE status = 'processing' AND worker_id = $1 AND result_metadata->>'batch_id' IS NULL
+                """,
+                self._worker_id,
+            )
+
+        # Parse "UPDATE N" to get count.
+        return recovered + (int(result.split()[-1]) if result else 0)
 
     async def _recover_batch_operations(self, schema: str | None) -> int:
         """
@@ -836,59 +922,53 @@ class WorkerPoller:
         """
         table = fq_table("async_operations", schema)
 
-        try:
-            async with self._backend.acquire() as conn:
-                # Find operations with batch_id in metadata (batch API operations)
-                rows = await conn.fetch(
-                    f"""
-                    SELECT operation_id, task_payload, result_metadata
-                    FROM {table}
-                    WHERE status = 'processing'
-                      AND result_metadata ? 'batch_id'
-                      AND task_payload IS NOT NULL
-                    """
-                )
+        async with self._backend.acquire() as conn:
+            # Find operations with batch_id in metadata (batch API operations)
+            rows = await conn.fetch(
+                f"""
+                SELECT operation_id, task_payload, result_metadata
+                FROM {table}
+                WHERE status = 'processing'
+                  AND result_metadata ? 'batch_id'
+                  AND task_payload IS NOT NULL
+                """
+            )
 
-            if not rows:
-                return 0
-
-            recovered = 0
-            for row in rows:
-                operation_id = str(row["operation_id"])
-                result_metadata = row["result_metadata"]
-
-                # Parse metadata
-                if isinstance(result_metadata, str):
-                    result_metadata = json.loads(result_metadata)
-
-                batch_id = result_metadata.get("batch_id")
-                batch_provider = result_metadata.get("batch_provider", "openai")
-
-                logger.info(
-                    f"Recovering batch operation: operation_id={operation_id}, batch_id={batch_id}, provider={batch_provider}"
-                )
-
-                # Mark operation as ready for re-processing
-                # Reset to pending with task_payload intact so worker picks it up again
-                async with self._backend.acquire() as conn:
-                    await conn.execute(
-                        f"""
-                        UPDATE {table}
-                        SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-                        WHERE operation_id = $1
-                        """,
-                        operation_id,
-                    )
-
-                recovered += 1
-                logger.info(f"Batch operation {operation_id} reset to pending for re-processing")
-
-            return recovered
-
-        except Exception as e:
-            schema_display = f'"{schema}"' if schema else str(schema)
-            logger.error(f"Failed to recover batch operations for schema {schema_display}: {e}")
+        if not rows:
             return 0
+
+        recovered = 0
+        for row in rows:
+            operation_id = str(row["operation_id"])
+            result_metadata = row["result_metadata"]
+
+            # Parse metadata
+            if isinstance(result_metadata, str):
+                result_metadata = json.loads(result_metadata)
+
+            batch_id = result_metadata.get("batch_id")
+            batch_provider = result_metadata.get("batch_provider", "openai")
+
+            logger.info(
+                f"Recovering batch operation: operation_id={operation_id}, batch_id={batch_id}, provider={batch_provider}"
+            )
+
+            # Mark operation as ready for re-processing.  Any failure escapes
+            # the startup gate; returning zero would strand a processing row.
+            async with self._backend.acquire() as conn:
+                await conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
+                    WHERE operation_id = $1
+                    """,
+                    operation_id,
+                )
+
+            recovered += 1
+            logger.info(f"Batch operation {operation_id} reset to pending for re-processing")
+
+        return recovered
 
     async def run(self):
         """
@@ -897,7 +977,9 @@ class WorkerPoller:
         Continuously polls for pending tasks, spawns them as background tasks,
         and immediately continues polling (up to slot limits).
         """
+        self._ready = False
         await self.recover_own_tasks()
+        consecutive_poll_errors = 0
 
         reservations_str = (
             ", ".join(f"{k}={v}" for k, v in self._slot_reservations.items()) if self._slot_reservations else "none"
@@ -908,62 +990,81 @@ class WorkerPoller:
             f"(max_slots={self._max_slots}, reservations=[{reservations_str}], shared_pool={shared_pool})"
         )
 
-        while not self._shutdown.is_set():
-            try:
-                # Claim a batch of tasks (respecting slot limits)
-                tasks = await self.claim_batch()
-
-                if tasks:
-                    # Log batch info
-                    task_types: dict[str, int] = {}
-                    schemas_seen: set[str | None] = set()
-                    consolidation_count = 0
-                    for task in tasks:
-                        t = task.task_dict.get("type", "unknown")
-                        op_type = task.task_dict.get("operation_type", "unknown")
-                        task_types[t] = task_types.get(t, 0) + 1
-                        schemas_seen.add(task.schema)
-                        if op_type == "consolidation":
-                            consolidation_count += 1
-
-                    types_str = ", ".join(f"{k}:{v}" for k, v in task_types.items())
-                    # Display None as "default" in logs
-                    schemas_str = ", ".join(s if s else "default" for s in schemas_seen)
-                    logger.info(
-                        f"Worker {self._worker_id} claimed {len(tasks)} tasks "
-                        f"({consolidation_count} consolidation): {types_str} (schemas: {schemas_str})"
-                    )
-
-                    # Spawn tasks as background jobs (fire-and-forget)
-                    for task in tasks:
-                        await self.execute_task(task)
-
-                    # Continue immediately to claim more tasks (if slots available)
-                    continue
-
-                # No tasks claimed (either no pending tasks or slots full)
-                # Wait before polling again
+        try:
+            while not self._shutdown.is_set():
+                self._raise_if_background_task_failed()
                 try:
-                    await asyncio.wait_for(
-                        self._shutdown.wait(),
-                        timeout=self._poll_interval_ms / 1000,
+                    # Claim a batch of tasks (respecting slot limits).  The
+                    # worker does not become ready until the complete cycle
+                    # below succeeds, proving it can actually interrogate and
+                    # service its queue after startup recovery.
+                    tasks = await self.claim_batch()
+
+                    if tasks:
+                        # Log batch info
+                        task_types: dict[str, int] = {}
+                        schemas_seen: set[str | None] = set()
+                        consolidation_count = 0
+                        for task in tasks:
+                            t = task.task_dict.get("type", "unknown")
+                            op_type = task.task_dict.get("operation_type", "unknown")
+                            task_types[t] = task_types.get(t, 0) + 1
+                            schemas_seen.add(task.schema)
+                            if op_type == "consolidation":
+                                consolidation_count += 1
+
+                        types_str = ", ".join(f"{k}:{v}" for k, v in task_types.items())
+                        # Display None as "default" in logs
+                        schemas_str = ", ".join(s if s else "default" for s in schemas_seen)
+                        logger.info(
+                            f"Worker {self._worker_id} claimed {len(tasks)} tasks "
+                            f"({consolidation_count} consolidation): {types_str} (schemas: {schemas_str})"
+                        )
+
+                        # Spawn tasks as background jobs (fire-and-forget)
+                        for task in tasks:
+                            await self.execute_task(task)
+
+                        self._ready = True
+                        consecutive_poll_errors = 0
+                        # Continue immediately to claim more tasks (if slots available)
+                        continue
+
+                    # Log progress stats periodically
+                    await self._log_progress_if_due()
+
+                    self._ready = True
+                    consecutive_poll_errors = 0
+
+                    # No tasks claimed (either no pending tasks or slots full)
+                    # Wait before polling again
+                    await self._wait_for_poll_interval_or_stop()
+
+                except WorkerBackgroundTaskError:
+                    raise
+                except asyncio.CancelledError:
+                    logger.info(f"Worker {self._worker_id} polling loop cancelled")
+                    break
+                except Exception as e:
+                    self._ready = False
+                    consecutive_poll_errors += 1
+                    logger.exception(
+                        "Worker %s error in polling loop (%d/%d): %s",
+                        self._worker_id,
+                        consecutive_poll_errors,
+                        MAX_CONSECUTIVE_POLL_ERRORS,
+                        e,
                     )
-                except asyncio.TimeoutError:
-                    pass  # Normal timeout, continue polling
-
-                # Log progress stats periodically
-                await self._log_progress_if_due()
-
-            except asyncio.CancelledError:
-                logger.info(f"Worker {self._worker_id} polling loop cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Worker {self._worker_id} error in polling loop: {e}")
-                traceback.print_exc()
-                # Backoff on error
-                await asyncio.sleep(1)
-
-        logger.info(f"Worker {self._worker_id} polling loop stopped")
+                    if consecutive_poll_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
+                        raise WorkerPollingUnavailableError(
+                            f"Worker {self._worker_id} polling remained unavailable for "
+                            f"{consecutive_poll_errors} consecutive attempts"
+                        ) from e
+                    # Backoff on error
+                    await asyncio.sleep(1)
+        finally:
+            self._ready = False
+            logger.info(f"Worker {self._worker_id} polling loop stopped")
 
     async def shutdown_graceful(self, timeout: float = 30.0):
         """
@@ -1377,3 +1478,8 @@ class WorkerPoller:
     def is_shutdown(self) -> bool:
         """Check if shutdown has been signaled."""
         return self._shutdown.is_set()
+
+    @property
+    def is_ready(self) -> bool:
+        """True only while the post-recovery polling loop is live."""
+        return self._ready

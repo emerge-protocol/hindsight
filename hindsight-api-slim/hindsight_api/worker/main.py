@@ -52,6 +52,61 @@ def _install_shutdown_signal_handlers(
     return True
 
 
+async def _wait_for_shutdown_or_worker_failure(
+    shutdown_requested: asyncio.Event,
+    poller_task: asyncio.Task,
+    http_task: asyncio.Task,
+) -> None:
+    """Wait for an operator shutdown, failing on either runtime task exit.
+
+    The standalone worker is one availability unit: a poller without its HTTP
+    readiness endpoint cannot be operated safely, and an HTTP server without a
+    poller must never remain up reporting database-only health.  Therefore any
+    completion of either task before an explicit shutdown is fatal, including a
+    clean return or cancellation.
+    """
+    shutdown_task = asyncio.create_task(shutdown_requested.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {shutdown_task, poller_task, http_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        for task_name, task in (("poller", poller_task), ("HTTP server", http_task)):
+            if task not in done:
+                continue
+            if task.cancelled():
+                raise RuntimeError(f"Worker {task_name} task was cancelled unexpectedly")
+            error = task.exception()
+            if error is not None:
+                raise RuntimeError(f"Worker {task_name} task failed") from error
+            raise RuntimeError(f"Worker {task_name} task exited unexpectedly")
+
+        # Only the explicit shutdown task completed; the runtime tasks are
+        # still live and will be drained by the caller's graceful-shutdown path.
+        if shutdown_task not in done:  # pragma: no cover - defensive invariant
+            raise RuntimeError("Worker supervisor woke without a completed task")
+    finally:
+        if not shutdown_task.done():
+            shutdown_task.cancel()
+        try:
+            await shutdown_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _cancel_task(task: asyncio.Task | None) -> None:
+    """Cancel and consume a task without replacing the supervisor's failure."""
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 def create_worker_app(poller: WorkerPoller, memory):
     """Create a minimal FastAPI app for worker metrics and health."""
     from fastapi import FastAPI
@@ -64,6 +119,9 @@ def create_worker_app(poller: WorkerPoller, memory):
         title="Hindsight Worker",
         description="Worker process for distributed task execution",
     )
+    # Filled immediately after task creation in ``run``.  Health remains 503
+    # through the startup-recovery barrier and for any poller task exit.
+    app.state.poller_task = None
 
     # Initialize OpenTelemetry metrics
     try:
@@ -89,9 +147,24 @@ def create_worker_app(poller: WorkerPoller, memory):
     )
     async def health_endpoint():
         """Health check endpoint."""
-        health = await memory.health_check()
+        # Copy the engine payload before adding worker-local state so a cached
+        # or test-double result cannot retain an earlier readiness downgrade.
+        health = dict(await memory.health_check())
+        poller_task = app.state.poller_task
+        poller_alive = poller_task is not None and not poller_task.done()
+        poller_ready = poller.is_ready
         health["worker_id"] = poller.worker_id
         health["is_shutdown"] = poller.is_shutdown
+        health["poller_alive"] = poller_alive
+        health["poller_ready"] = poller_ready
+        if not poller_alive or not poller_ready or poller.is_shutdown:
+            health["status"] = "unhealthy"
+            if poller.is_shutdown:
+                health["reason"] = "worker_shutting_down"
+            elif not poller_alive:
+                health["reason"] = "poller_not_running"
+            else:
+                health["reason"] = "poller_not_ready"
         status_code = 200 if health.get("status") == "healthy" else 503
         return JSONResponse(content=health, status_code=status_code)
 
@@ -314,43 +387,39 @@ def main():
         )
         server = uvicorn.Server(uvicorn_config)
 
-        # Run the poller and HTTP server concurrently
-        poller_task = asyncio.create_task(poller.run())
-        http_task = asyncio.create_task(server.serve())
+        # Run and supervise the poller and HTTP server as one availability
+        # unit.  Health is not ready until the poller has passed recovery.
+        poller_task = asyncio.create_task(poller.run(), name="hindsight-worker-poller")
+        app.state.poller_task = poller_task
+        http_task = asyncio.create_task(server.serve(), name="hindsight-worker-http")
 
         print(f"Worker started. Metrics available at http://{args.http_host}:{args.http_port}/metrics")
 
-        # Wait for shutdown signal
         try:
-            await shutdown_requested.wait()
+            await _wait_for_shutdown_or_worker_failure(shutdown_requested, poller_task, http_task)
         except KeyboardInterrupt:
             print("\nReceived interrupt, initiating graceful shutdown...")
+        finally:
+            # Graceful shutdown also runs after a supervised task failure so no
+            # peer task, DB pool, or in-flight operation survives the process.
+            print("Shutting down HTTP server...")
+            server.should_exit = True
 
-        # Graceful shutdown
-        print("Shutting down HTTP server...")
-        server.should_exit = True
+            print("Waiting for poller to finish...")
+            await poller.shutdown_graceful(timeout=30.0)
+            await _cancel_task(poller_task)
 
-        print("Waiting for poller to finish...")
-        await poller.shutdown_graceful(timeout=30.0)
-        poller_task.cancel()
-        try:
-            await poller_task
-        except asyncio.CancelledError:
-            pass
-
-        # Wait for HTTP server to finish
-        try:
-            await asyncio.wait_for(http_task, timeout=5.0)
-        except asyncio.TimeoutError:
-            http_task.cancel()
             try:
-                await http_task
+                await asyncio.wait_for(asyncio.shield(http_task), timeout=5.0)
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                pass
+            await _cancel_task(http_task)
 
-        # Close memory engine
-        await memory.close()
-        print("Worker shutdown complete")
+            # Close memory engine
+            await memory.close()
+            print("Worker shutdown complete")
 
     def cleanup():
         """Synchronous cleanup for atexit."""
