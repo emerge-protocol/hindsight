@@ -414,11 +414,17 @@ def main():
         finally:
             # Graceful shutdown also runs after a supervised task failure so no
             # peer task, DB pool, or in-flight operation survives the process.
+            shutdown_error: Exception | None = None
             print("Shutting down HTTP server...")
             server.should_exit = True
 
             print("Waiting for poller to finish...")
-            await poller.shutdown_graceful(timeout=30.0)
+            try:
+                await poller.shutdown_graceful(timeout=30.0)
+            except Exception as exc:
+                # Finish closing the poller, HTTP task, and DB pool before
+                # surfacing a terminal queue-state failure as a non-zero exit.
+                shutdown_error = exc
             await _cancel_task(poller_task)
 
             try:
@@ -432,6 +438,8 @@ def main():
             # Close memory engine
             await memory.close()
             print("Worker shutdown complete")
+            if shutdown_error is not None:
+                raise shutdown_error
 
     def cleanup():
         """Synchronous cleanup for atexit."""

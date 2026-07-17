@@ -624,6 +624,37 @@ async def test_saturation_timeout_is_supervised_fatal_without_poll_retries():
 
 
 @pytest.mark.asyncio
+async def test_graceful_shutdown_propagates_terminal_queue_failure_after_drain():
+    release = asyncio.Event()
+
+    async def fail_terminally(_task):
+        await release.wait()
+        raise OperationTerminalStateError("completed queue write denied")
+
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=fail_terminally,
+        tenant_extension=MagicMock(),
+    )
+    claimed = ClaimedTask(
+        operation_id="00000000-0000-0000-0000-000000000090",
+        task_dict={"type": "graph_maintenance", "bank_id": "bank-test"},
+        schema=None,
+    )
+    await poller.execute_task(claimed)
+    shutdown_task = asyncio.create_task(poller.shutdown_graceful(timeout=2.0))
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(WorkerBackgroundTaskError, match="authoritative queue state") as raised:
+        await shutdown_task
+
+    assert isinstance(raised.value.__cause__, OperationTerminalStateError)
+    assert poller.is_ready is False
+
+
+@pytest.mark.asyncio
 async def test_transient_recovery_failure_then_success_gates_readiness():
     poller = _poller()
     poller.recover_own_tasks = AsyncMock(side_effect=[RuntimeError("database unavailable"), 0])

@@ -1178,6 +1178,11 @@ class WorkerPoller:
                 active_task_objects = [info.bg_task for info in self._active_tasks.values()]
 
             if in_flight == 0:
+                # A task can finish between the poll loop observing shutdown
+                # and this drain boundary. Its done callback records terminal
+                # queue-state failures synchronously; never turn that failure
+                # into a clean SIGTERM exit.
+                self._raise_if_background_task_failed()
                 logger.info(f"Worker {self._worker_id} graceful shutdown complete")
                 return
 
@@ -1193,9 +1198,18 @@ class WorkerPoller:
 
         # Cancel remaining tasks
         async with self._in_flight_lock:
+            remaining_tasks = []
             for operation_id, info in list(self._active_tasks.items()):
                 if not info.bg_task.done():
                     info.bg_task.cancel()
+                remaining_tasks.append(info.bg_task)
+
+        if remaining_tasks:
+            await asyncio.gather(*remaining_tasks, return_exceptions=True)
+            # Let synchronous done callbacks schedule their bookkeeping before
+            # the final fatal-state check.
+            await asyncio.sleep(0)
+        self._raise_if_background_task_failed()
 
     async def _log_progress_if_due(self):
         """Log progress stats every PROGRESS_LOG_INTERVAL seconds.
