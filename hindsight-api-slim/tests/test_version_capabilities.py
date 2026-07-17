@@ -27,5 +27,5 @@ async def test_version_reports_retain_consolidation_exclusion_only_when_supporte
 
     assert response.status_code == 200
     body = response.json()
-    assert body["api_version"] == "0.8.4+morgan.2"
+    assert body["api_version"] == "0.8.4+morgan.3"
     assert body["features"]["retain_consolidation_exclusion"] is expected

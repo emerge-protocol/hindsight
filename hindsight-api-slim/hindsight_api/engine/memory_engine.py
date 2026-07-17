@@ -70,6 +70,18 @@ from .operation_metadata import (
     RetainOutcomeAggregate,
     RetainOutcomeMetadata,
 )
+from .queue_claim import (
+    active_queue_claim as _active_queue_claim,
+)
+from .queue_claim import (
+    bind_queue_claim as _bind_queue_claim,
+)
+from .queue_claim import (
+    queue_claim_predicate as _queue_claim_predicate,
+)
+from .queue_claim import (
+    require_guarded_update as _require_guarded_update,
+)
 from .sql import SQLDialect, create_sql_dialect
 
 # Context variable for current schema (async-safe, per-task isolation)
@@ -1463,13 +1475,16 @@ class MemoryEngine(MemoryEngineInterface):
             }
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
-                await conn.execute(
+                claim_predicate, claim_args = _queue_claim_predicate(3)
+                update_result = await conn.execute(
                     f"UPDATE {fq_table('async_operations')} "
                     f"SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $1::jsonb "
-                    f"WHERE operation_id = $2",
+                    f"WHERE operation_id = $2{claim_predicate}",
                     json.dumps(counts, default=_json_default),
                     uuid.UUID(operation_id),
+                    *claim_args,
                 )
+                _require_guarded_update(update_result, operation_id, "record import outcome for")
 
         # Best-effort cleanup of the transient upload.
         try:
@@ -1595,6 +1610,8 @@ class MemoryEngine(MemoryEngineInterface):
             )
             markdown_content = sanitize_llm_output(convert_result.content) or ""
             winning_parser = convert_result.parser_name
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             # Re-raise with filename context for better error reporting
             error_msg = f"Failed to parse file '{filename}': {str(e)}"
@@ -1605,6 +1622,13 @@ class MemoryEngine(MemoryEngineInterface):
             f"[FILE_CONVERT_RETAIN] Converted file for bank_id={bank_id}, "
             f"document_id={document_id}, {len(markdown_content)} chars. Submitting retain task."
         )
+
+        # Conversion can be slow. Re-attest the exact claim generation before
+        # billing hooks or queue writes so a restarted/decommissioned claim
+        # cannot enqueue a successor retain task.
+        if operation_id and not await self._check_op_alive(operation_id):
+            logger.info("File conversion operation %s was cancelled or deleted; skipping retain enqueue", operation_id)
+            return
 
         # Fire file conversion hook (e.g., for Iris billing)
         if self._operation_validator:
@@ -1699,14 +1723,21 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
                 if operation_id:
-                    await conn.execute(
+                    claim_predicate, claim_args = _queue_claim_predicate(2)
+                    completed_row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
-                        WHERE operation_id = $1
+                        WHERE operation_id = $1{claim_predicate}
+                        RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
+                        *claim_args,
                     )
+                    if completed_row is None and _active_queue_claim() is not None:
+                        raise OperationQueueAuthorityError(
+                            f"Lost queue claim generation while completing file conversion {operation_id}"
+                        )
 
         # For SyncTaskBackend: executes the retain task inline.
         # For BrokerTaskBackend: no-op (submit_task's UPDATE skips rows whose
@@ -1888,6 +1919,7 @@ class MemoryEngine(MemoryEngineInterface):
         logger.info(f"[REFRESH_MENTAL_MODEL_TASK] Completed for bank_id={bank_id}, mental_model_id={mental_model_id}")
 
     @_bind_bank_id("task_dict", key="bank_id")
+    @_bind_queue_claim("task_dict")
     async def execute_task(self, task_dict: dict[str, Any]):
         """
         Execute a task by routing it to the appropriate handler.
@@ -1901,9 +1933,14 @@ class MemoryEngine(MemoryEngineInterface):
         """
         task_type = task_dict.get("type")
         expected_worker_id = task_dict.pop("_worker_id", None)
+        expected_claim_token = task_dict.pop("_claim_token", None)
         claimed_operation_id = task_dict.pop("_operation_id", None)
         payload_operation_id = task_dict.get("operation_id")
-        if expected_worker_id is not None:
+        if expected_worker_id is not None or expected_claim_token is not None:
+            if not isinstance(expected_worker_id, str) or not expected_worker_id:
+                raise OperationPayloadIntegrityError("Worker task is missing its database-authoritative worker id")
+            if not isinstance(expected_claim_token, str) or not expected_claim_token:
+                raise OperationPayloadIntegrityError("Worker task is missing its database-authoritative claim token")
             if not claimed_operation_id:
                 raise OperationPayloadIntegrityError(
                     "Worker task is missing its database-authoritative claimed operation id"
@@ -1926,35 +1963,44 @@ class MemoryEngine(MemoryEngineInterface):
             self._ext_ctx.current_schema = schema
 
         # Prove queue authority before any provider or storage side effect. A
-        # standalone poller supplies its worker id, so horizontally scaled
-        # workers also prove that the processing claim still belongs to this
-        # process. Direct/internal callers without a worker id retain the
-        # legacy status-only check.
+        # standalone poller supplies its worker id and a fresh token for every
+        # claim generation, so horizontally scaled workers and same-worker ABA
+        # races both prove that the processing claim still belongs to this
+        # exact execution. Direct/internal callers retain the legacy
+        # status-only check.
         if operation_id:
             try:
                 backend = await self._get_backend()
                 async with acquire_with_retry(backend) as conn:
                     result = await conn.fetchrow(
-                        f"SELECT status, worker_id FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                        f"SELECT status, worker_id, claim_token "
+                        f"FROM {fq_table('async_operations')} WHERE operation_id = $1",
                         uuid.UUID(operation_id),
                     )
                     if not result or result["status"] == "cancelled":
                         logger.info(f"Skipping cancelled or deleted operation: {operation_id}")
                         return
                     if expected_worker_id is not None and (
-                        result["status"] != "processing" or result["worker_id"] != expected_worker_id
+                        result["status"] != "processing"
+                        or result["worker_id"] != expected_worker_id
+                        or result["claim_token"] != expected_claim_token
                     ):
                         logger.warning(
                             "Skipping operation %s because queue authority moved "
-                            "(expected_worker=%s, status=%s, actual_worker=%s)",
+                            "(expected_worker=%s, status=%s, actual_worker=%s, claim_generation_matches=%s)",
                             operation_id,
                             expected_worker_id,
                             result["status"],
                             result["worker_id"],
+                            result["claim_token"] == expected_claim_token,
                         )
-                        return
+                        raise OperationQueueAuthorityError(
+                            f"Queue claim generation moved before operation {operation_id} could start"
+                        )
             except Exception as e:
                 logger.error(f"Failed to check operation status {operation_id}: {e}")
+                if isinstance(e, OperationQueueAuthorityError):
+                    raise
                 raise OperationQueueAuthorityError(
                     f"Failed to prove runnable queue authority for operation {operation_id}"
                 ) from e
@@ -2123,6 +2169,10 @@ class MemoryEngine(MemoryEngineInterface):
 
             from ..webhooks.models import ConsolidationEventData, WebhookEvent, WebhookEventType
 
+            if not await self._check_op_alive(operation_id):
+                logger.info("Consolidation operation %s was cancelled or deleted; skipping webhook", operation_id)
+                return
+
             data = ConsolidationEventData(
                 observations_created=result.get("observations_created") if result else None,
                 observations_updated=result.get("observations_updated") if result else None,
@@ -2138,6 +2188,8 @@ class MemoryEngine(MemoryEngineInterface):
                 data=data,
             )
             await self._webhook_manager.fire_event(event, schema=schema)
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Failed to fire consolidation webhook for operation {operation_id}: {e}")
 
@@ -2231,11 +2283,18 @@ class MemoryEngine(MemoryEngineInterface):
                 }
             )
             async with acquire_with_retry(backend) as conn:
-                await conn.execute(
-                    f"UPDATE {fq_table('async_operations')} SET result_metadata = $2::jsonb, updated_at = now() WHERE operation_id = $1",
+                claim_predicate, claim_args = _queue_claim_predicate(3)
+                result = await conn.execute(
+                    f"UPDATE {fq_table('async_operations')} "
+                    f"SET result_metadata = $2::jsonb, updated_at = now() "
+                    f"WHERE operation_id = $1{claim_predicate}",
                     uuid.UUID(operation_id),
                     meta,
+                    *claim_args,
                 )
+                _require_guarded_update(result, operation_id, "record webhook delivery metadata for")
+        except OperationQueueAuthorityError:
+            raise
         except Exception as meta_err:
             logger.debug(f"Failed to update webhook delivery metadata: {meta_err}")
 
@@ -2255,8 +2314,8 @@ class MemoryEngine(MemoryEngineInterface):
         raw_payload = task_dict["payload"]
         retry_count = task_dict.get("_retry_count", 0)
         # execute_task replaces the private claim field with the exact public
-        # operation_id before dispatch. Reading the private field here drops
-        # delivery metadata for every standalone-worker webhook.
+        # operation_id before dispatch. Reading the private field here used to
+        # drop delivery metadata for every standalone-worker webhook.
         operation_id: str | None = task_dict.get("operation_id")
         http_config = WebhookHttpConfig.model_validate(task_dict.get("http_config") or {})
 
@@ -2290,6 +2349,8 @@ class MemoryEngine(MemoryEngineInterface):
             response.raise_for_status()
             if operation_id:
                 await self._update_webhook_delivery_metadata(operation_id, response.status_code, response.text)
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             status_code = response.status_code if response is not None else None
             response_body = response.text if response is not None else None
@@ -2319,10 +2380,24 @@ class MemoryEngine(MemoryEngineInterface):
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
                 row = await conn.fetchrow(
-                    f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                    f"SELECT status, worker_id, claim_token "
+                    f"FROM {fq_table('async_operations')} WHERE operation_id = $1",
                     uuid.UUID(operation_id),
                 )
-                return row is not None and row["status"] != "cancelled"
+                if row is None or row["status"] == "cancelled":
+                    return False
+                claim = _active_queue_claim()
+                if claim is not None and (
+                    row["status"] != "processing"
+                    or row["worker_id"] != claim.worker_id
+                    or row["claim_token"] != claim.claim_token
+                ):
+                    raise OperationQueueAuthorityError(
+                        f"Queue claim generation moved while operation {operation_id} was running"
+                    )
+                return True
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Failed to check operation liveness {operation_id}: {e}")
             raise OperationQueueAuthorityError(f"Failed to prove queue liveness for operation {operation_id}") from e
@@ -2344,9 +2419,10 @@ class MemoryEngine(MemoryEngineInterface):
         row — so an operator polling the operation status API can see the current stage
         and counters and tell a healthy long-running job from a frozen one.
 
-        Best-effort: a failed heartbeat must never fail the underlying job, so all errors
-        are swallowed with a debug log. A ``None`` operation_id (synchronous / untracked
-        call sites) is a no-op.
+        Best-effort for ordinary database errors: a failed heartbeat must never fail the
+        underlying job. Claim-generation loss is authoritative, however, and aborts a
+        worker task before it can mutate a successor claim. A ``None`` operation_id
+        (synchronous / untracked call sites) is a no-op.
         """
         if not operation_id:
             return
@@ -2360,13 +2436,18 @@ class MemoryEngine(MemoryEngineInterface):
         try:
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
-                await conn.execute(
+                claim_predicate, claim_args = _queue_claim_predicate(3)
+                result = await conn.execute(
                     f"UPDATE {fq_table('async_operations')} "
                     f"SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb, "
-                    f"updated_at = now() WHERE operation_id = $1",
+                    f"updated_at = now() WHERE operation_id = $1{claim_predicate}",
                     uuid.UUID(operation_id),
                     json.dumps({"progress": snapshot}),
+                    *claim_args,
                 )
+                _require_guarded_update(result, operation_id, "write progress for")
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             logger.debug(f"Failed to write operation progress for {operation_id}: {e}")
 
@@ -2385,17 +2466,23 @@ class MemoryEngine(MemoryEngineInterface):
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
                     # Mark this operation as failed
+                    claim_predicate, claim_args = _queue_claim_predicate(3)
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'failed', error_message = $2, updated_at = NOW()
-                        WHERE operation_id = $1
+                        WHERE operation_id = $1{claim_predicate}
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
                         truncated_error,
+                        *claim_args,
                     )
                     if row is None:
+                        if _active_queue_claim() is not None:
+                            raise OperationQueueAuthorityError(
+                                f"Lost queue claim generation while marking operation {operation_id} failed"
+                            )
                         logger.info(f"Operation {operation_id} no longer exists (bank deleted), skipping mark-failed")
                         return
                     logger.info(f"Marked async operation as failed: {operation_id}")
@@ -2403,6 +2490,8 @@ class MemoryEngine(MemoryEngineInterface):
                     # Check if this is a child operation and update parent if all siblings are done
                     # This happens in the same transaction after the child status is updated
                     await self._maybe_update_parent_operation(operation_id, conn)
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Failed to mark operation as failed {operation_id}: {e}")
             # Worker execution cannot report success while its authoritative
@@ -2423,16 +2512,22 @@ class MemoryEngine(MemoryEngineInterface):
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
                     # Mark this operation as completed
+                    claim_predicate, claim_args = _queue_claim_predicate(2)
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
-                        WHERE operation_id = $1
+                        WHERE operation_id = $1{claim_predicate}
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
+                        *claim_args,
                     )
                     if row is None:
+                        if _active_queue_claim() is not None:
+                            raise OperationQueueAuthorityError(
+                                f"Lost queue claim generation while marking operation {operation_id} completed"
+                            )
                         logger.info(
                             f"Operation {operation_id} no longer exists (bank deleted), skipping mark-completed"
                         )
@@ -2442,6 +2537,8 @@ class MemoryEngine(MemoryEngineInterface):
                     # Check if this is a child operation and update parent if all siblings are done
                     # This happens in the same transaction after the child status is updated
                     await self._maybe_update_parent_operation(operation_id, conn)
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Failed to mark operation as completed {operation_id}: {e}")
             raise OperationTerminalStateError(
@@ -2457,11 +2554,18 @@ class MemoryEngine(MemoryEngineInterface):
         try:
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
+                select_predicate, select_args = _queue_claim_predicate(2)
                 row = await conn.fetchrow(
-                    f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                    f"SELECT result_metadata FROM {fq_table('async_operations')} "
+                    f"WHERE operation_id = $1{select_predicate}",
                     uuid.UUID(operation_id),
+                    *select_args,
                 )
                 if not row:
+                    if _active_queue_claim() is not None:
+                        raise OperationQueueAuthorityError(
+                            f"Lost queue claim generation while reading retain outcome for {operation_id}"
+                        )
                     return
 
                 metadata = conn.parse_json(row["result_metadata"]) or {}
@@ -2473,16 +2577,21 @@ class MemoryEngine(MemoryEngineInterface):
                     extraction_errors_sample=extraction_errors.sample,
                 )
 
-                await conn.execute(
+                update_predicate, update_args = _queue_claim_predicate(3)
+                result = await conn.execute(
                     f"""
                     UPDATE {fq_table("async_operations")}
                     SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb,
                         updated_at = now()
-                    WHERE operation_id = $1
+                    WHERE operation_id = $1{update_predicate}
                     """,
                     uuid.UUID(operation_id),
                     json.dumps(outcome.to_dict()),
+                    *update_args,
                 )
+                _require_guarded_update(result, operation_id, "write retain outcome for")
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             # Best-effort, but log loudly: the whole point of this metadata is to
             # give clients a reliable success/silent-failure signal, so a missing
@@ -2510,16 +2619,22 @@ class MemoryEngine(MemoryEngineInterface):
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
+                    claim_predicate, claim_args = _queue_claim_predicate(2)
                     row = await conn.fetchrow(
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'completed', updated_at = NOW(), completed_at = NOW()
-                        WHERE operation_id = $1
+                        WHERE operation_id = $1{claim_predicate}
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
+                        *claim_args,
                     )
                     if row is None:
+                        if _active_queue_claim() is not None:
+                            raise OperationQueueAuthorityError(
+                                f"Lost queue claim generation while completing consolidation {operation_id}"
+                            )
                         logger.info(
                             f"Operation {operation_id} no longer exists (bank deleted), skipping mark-completed"
                         )
@@ -2544,6 +2659,8 @@ class MemoryEngine(MemoryEngineInterface):
                             data=data,
                         )
                         await self._webhook_manager.fire_event_with_conn(event, conn, schema=schema)
+        except OperationQueueAuthorityError:
+            raise
         except Exception as e:
             logger.error(f"Failed to mark operation completed and fire webhook {operation_id}: {e}")
             raise OperationTerminalStateError(
@@ -12012,6 +12129,7 @@ class MemoryEngine(MemoryEngineInterface):
                     completed_at = NULL,
                     next_retry_at = NULL,
                     worker_id = NULL,
+                    claim_token = NULL,
                     claimed_at = NULL,
                     retry_count = 0,
                     updated_at = NOW()

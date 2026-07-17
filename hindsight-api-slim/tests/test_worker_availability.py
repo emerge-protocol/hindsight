@@ -13,6 +13,8 @@ from hindsight_api.config import (
     ENV_WORKER_SATURATION_TIMEOUT_SECONDS,
     HindsightConfig,
 )
+from hindsight_api.engine.db.ops_oracle import OracleOps
+from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
 from hindsight_api.engine.memory_engine import MemoryEngine, UnsupportedWorkerTaskError
 from hindsight_api.worker import main as worker_main
 from hindsight_api.worker.exceptions import (
@@ -34,6 +36,8 @@ from hindsight_api.worker.poller import (
     WorkerSaturationTimeoutError,
 )
 from hindsight_api.worker.stage import StageHolder
+
+CLAIM_TOKEN = "claim-token-test"
 
 
 def test_worker_output_never_serializes_database_url():
@@ -223,7 +227,11 @@ class _DeniedAuthorityBackend:
         self.acquire_count += 1
         if self.acquire_count == 1:
             connection = AsyncMock()
-            connection.fetchrow.return_value = {"status": "processing", "worker_id": "worker-test"}
+            connection.fetchrow.return_value = {
+                "status": "processing",
+                "worker_id": "worker-test",
+                "claim_token": CLAIM_TOKEN,
+            }
             context = AsyncMock()
             context.__aenter__.return_value = connection
             context.__aexit__.return_value = False
@@ -257,6 +265,103 @@ class _StaticAuthorityBackend:
         return context
 
 
+class _ConnectionBackend:
+    """Reuse one deterministic connection across engine authority checkpoints."""
+
+    _wraps_backend = True
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def acquire(self):
+        context = AsyncMock()
+        context.__aenter__.return_value = self.connection
+        context.__aexit__.return_value = False
+        return context
+
+
+def _transactional_connection() -> MagicMock:
+    connection = MagicMock()
+    connection.fetchrow = AsyncMock()
+    connection.fetch = AsyncMock()
+    connection.execute = AsyncMock()
+    transaction = AsyncMock()
+    transaction.__aenter__.return_value = None
+    transaction.__aexit__.return_value = False
+    connection.transaction.return_value = transaction
+    return connection
+
+
+def _claimed_engine_task(operation_id: str, *, claim_token: str = CLAIM_TOKEN) -> dict:
+    return {
+        "type": "graph_maintenance",
+        "operation_id": operation_id,
+        "bank_id": "bank-test",
+        "_worker_id": "worker-test",
+        "_claim_token": claim_token,
+        "_operation_id": operation_id,
+    }
+
+
+@pytest.mark.parametrize("ops_class", [PostgreSQLOps, OracleOps])
+@pytest.mark.asyncio
+async def test_provider_claim_persists_exact_generation_before_returning_rows(ops_class):
+    operation_id = "00000000-0000-0000-0000-000000000073"
+    row = {
+        "operation_id": operation_id,
+        "operation_type": "graph_maintenance",
+        "task_payload": {"type": "graph_maintenance"},
+        "retry_count": 0,
+    }
+    connection = _transactional_connection()
+    connection.fetch.return_value = [row]
+    connection.execute.return_value = "UPDATE 1"
+
+    rows = await ops_class().claim_tasks(
+        connection,
+        "async_operations",
+        "worker-test",
+        CLAIM_TOKEN,
+        {},
+        1,
+    )
+
+    assert rows == [row]
+    sql, worker_id, claim_token, operation_ids = connection.execute.await_args.args
+    assert "status = 'processing'" in sql
+    assert "claim_token = $2" in sql
+    assert "status = 'pending'" in sql
+    assert worker_id == "worker-test"
+    assert claim_token == CLAIM_TOKEN
+    assert operation_ids == [operation_id]
+
+
+@pytest.mark.parametrize("ops_class", [PostgreSQLOps, OracleOps])
+@pytest.mark.asyncio
+async def test_provider_claim_update_count_mismatch_rolls_back_claim_transaction(ops_class):
+    operation_id = "00000000-0000-0000-0000-000000000072"
+    connection = _transactional_connection()
+    connection.fetch.return_value = [
+        {
+            "operation_id": operation_id,
+            "operation_type": "graph_maintenance",
+            "task_payload": {"type": "graph_maintenance"},
+            "retry_count": 0,
+        }
+    ]
+    connection.execute.return_value = "UPDATE 0"
+
+    with pytest.raises(RuntimeError, match="persisted 0 claim generations"):
+        await ops_class().claim_tasks(
+            connection,
+            "async_operations",
+            "worker-test",
+            CLAIM_TOKEN,
+            {},
+            1,
+        )
+
+
 @pytest.mark.asyncio
 async def test_queue_authority_read_failure_prevents_task_side_effects():
     memory = object.__new__(MemoryEngine)
@@ -273,12 +378,82 @@ async def test_queue_authority_read_failure_prevents_task_side_effects():
                 "operation_id": operation_id,
                 "bank_id": "bank-test",
                 "_worker_id": "worker-test",
+                "_claim_token": CLAIM_TOKEN,
                 "_operation_id": operation_id,
             }
         )
 
     assert isinstance(raised.value.__cause__, RuntimeError)
     memory._handle_graph_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_same_worker_aba_preflight_prevents_task_side_effects():
+    operation_id = "00000000-0000-0000-0000-000000000082"
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(
+        return_value=_StaticAuthorityBackend(
+            {"status": "processing", "worker_id": "worker-test", "claim_token": "successor-token"}
+        )
+    )
+    memory._handle_graph_maintenance = AsyncMock(return_value=None)
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation moved"):
+        await memory.execute_task(_claimed_engine_task(operation_id))
+
+    memory._handle_graph_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_same_worker_aba_terminal_update_zero_fails_closed_after_handler():
+    operation_id = "00000000-0000-0000-0000-000000000081"
+    connection = _transactional_connection()
+    connection.fetchrow.side_effect = [
+        {"status": "processing", "worker_id": "worker-test", "claim_token": CLAIM_TOKEN},
+        None,
+    ]
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(return_value=_ConnectionBackend(connection))
+    memory._handle_graph_maintenance = AsyncMock(return_value=None)
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
+        await memory.execute_task(_claimed_engine_task(operation_id))
+
+    memory._handle_graph_maintenance.assert_awaited_once()
+    terminal_sql, _operation_id, worker_id, claim_token = connection.fetchrow.await_args_list[1].args
+    assert "status = 'processing'" in terminal_sql
+    assert "worker_id = $2" in terminal_sql
+    assert "claim_token = $3" in terminal_sql
+    assert worker_id == "worker-test"
+    assert claim_token == CLAIM_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_same_worker_aba_checkpoint_fails_before_terminal_write():
+    operation_id = "00000000-0000-0000-0000-000000000080"
+    connection = _transactional_connection()
+    connection.fetchrow.side_effect = [
+        {"status": "processing", "worker_id": "worker-test", "claim_token": CLAIM_TOKEN},
+        {"status": "processing", "worker_id": "worker-test", "claim_token": "successor-token"},
+    ]
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(return_value=_ConnectionBackend(connection))
+
+    async def checkpoint(_task):
+        await memory._check_op_alive(operation_id)
+
+    memory._handle_graph_maintenance = AsyncMock(side_effect=checkpoint)
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation moved"):
+        await memory.execute_task(_claimed_engine_task(operation_id))
+
+    assert connection.fetchrow.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -298,34 +473,44 @@ async def test_moved_queue_authority_prevents_task_side_effects():
     memory._audit_logger = None
     memory._ext_ctx = MagicMock()
     memory._get_backend = AsyncMock(
-        return_value=_StaticAuthorityBackend({"status": "processing", "worker_id": "worker-peer"})
+        return_value=_StaticAuthorityBackend(
+            {"status": "processing", "worker_id": "worker-peer", "claim_token": "peer-token"}
+        )
     )
     memory._handle_graph_maintenance = AsyncMock(return_value=None)
 
-    await memory.execute_task(
-        {
-            "type": "graph_maintenance",
-            "operation_id": "00000000-0000-0000-0000-000000000096",
-            "bank_id": "bank-test",
-            "_worker_id": "worker-test",
-            "_operation_id": "00000000-0000-0000-0000-000000000096",
-        }
-    )
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation moved"):
+        await memory.execute_task(
+            {
+                "type": "graph_maintenance",
+                "operation_id": "00000000-0000-0000-0000-000000000096",
+                "bank_id": "bank-test",
+                "_worker_id": "worker-test",
+                "_claim_token": CLAIM_TOKEN,
+                "_operation_id": "00000000-0000-0000-0000-000000000096",
+            }
+        )
 
     memory._handle_graph_maintenance.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_batch_startup_recovery_is_scoped_to_exact_worker_owner():
-    connection = AsyncMock()
+    connection = MagicMock()
+    connection.fetch = AsyncMock()
     connection.fetch.return_value = [
         {
             "operation_id": "00000000-0000-0000-0000-000000000097",
             "task_payload": {"type": "batch_retain"},
             "result_metadata": {"batch_id": "batch-1", "batch_provider": "openai"},
+            "claim_token": CLAIM_TOKEN,
         }
     ]
-    connection.execute.return_value = "UPDATE 1"
+    connection.execute = AsyncMock(return_value="UPDATE 1")
+    transaction = AsyncMock()
+    transaction.__aenter__.return_value = None
+    transaction.__aexit__.return_value = False
+    connection.transaction.return_value = transaction
     context = AsyncMock()
     context.__aenter__.return_value = connection
     context.__aexit__.return_value = False
@@ -343,10 +528,12 @@ async def test_batch_startup_recovery_is_scoped_to_exact_worker_owner():
     select_sql, select_worker_id = connection.fetch.await_args.args
     assert "AND worker_id = $1" in select_sql
     assert select_worker_id == "worker-test"
-    update_sql, _operation_id, update_worker_id = connection.execute.await_args.args
+    update_sql, _operation_id, update_worker_id, update_claim_token = connection.execute.await_args.args
     assert "AND worker_id = $2" in update_sql
+    assert "claim_token = $3" in update_sql
     assert "AND status = 'processing'" in update_sql
     assert update_worker_id == "worker-test"
+    assert update_claim_token == CLAIM_TOKEN
 
 
 async def _claim_one_for_authority_test(task_payload: dict, operation_id: str) -> ClaimedTask:
@@ -378,15 +565,22 @@ async def _claim_one_for_authority_test(task_payload: dict, operation_id: str) -
     )
     claimed = await poller._claim_batch_for_schema_inner(None, {}, 1)
     assert len(claimed) == 1
+    claim_call = backend.ops.claim_tasks.await_args.args
+    assert claim_call[2] == "worker-test"
+    assert isinstance(claim_call[3], str) and claim_call[3]
+    assert claimed[0].claim_token == claim_call[3]
+    assert claimed[0].task_dict["_claim_token"] == claim_call[3]
     return claimed[0]
 
 
-def _authority_test_memory() -> MemoryEngine:
+def _authority_test_memory(claim_token: str = CLAIM_TOKEN) -> MemoryEngine:
     memory = object.__new__(MemoryEngine)
     memory._audit_logger = None
     memory._ext_ctx = MagicMock()
     memory._get_backend = AsyncMock(
-        return_value=_StaticAuthorityBackend({"status": "processing", "worker_id": "worker-test"})
+        return_value=_StaticAuthorityBackend(
+            {"status": "processing", "worker_id": "worker-test", "claim_token": claim_token}
+        )
     )
     memory._handle_graph_maintenance = AsyncMock(return_value=None)
     memory._mark_operation_completed = AsyncMock(return_value=None)
@@ -400,7 +594,7 @@ async def test_poller_binds_missing_payload_id_to_exact_claim_before_engine_side
         {"type": "graph_maintenance", "bank_id": "bank-test"},
         operation_id,
     )
-    memory = _authority_test_memory()
+    memory = _authority_test_memory(claimed.claim_token or "")
     poller = WorkerPoller(
         backend=MagicMock(),
         worker_id="worker-test",
@@ -427,7 +621,7 @@ async def test_poller_marks_payload_id_mismatch_failed_without_restart_loop():
         },
         operation_id,
     )
-    memory = _authority_test_memory()
+    memory = _authority_test_memory(claimed.claim_token or "")
     poller = WorkerPoller(
         backend=MagicMock(),
         worker_id="worker-test",
@@ -445,6 +639,7 @@ async def test_poller_marks_payload_id_mismatch_failed_without_restart_loop():
         operation_id,
         "Worker task payload operation id does not match its database-authoritative claim",
         None,
+        claimed.claim_token,
     )
 
 
@@ -459,6 +654,7 @@ async def test_missing_claimed_id_is_deterministic_payload_integrity_failure():
                 "operation_id": "00000000-0000-0000-0000-000000000092",
                 "bank_id": "bank-test",
                 "_worker_id": "worker-test",
+                "_claim_token": CLAIM_TOKEN,
             }
         )
 
@@ -484,6 +680,7 @@ def _claimed_webhook_task(operation_id: str) -> dict:
         "payload": {"status": "completed"},
         "_retry_count": 0,
         "_worker_id": "worker-test",
+        "_claim_token": CLAIM_TOKEN,
         "_operation_id": operation_id,
     }
 
@@ -515,6 +712,59 @@ async def test_claimed_webhook_failure_writes_metadata_for_authoritative_operati
 
     memory._update_webhook_delivery_metadata.assert_awaited_once_with(operation_id, 503, "busy")
     memory._mark_operation_completed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claimed_webhook_integrates_authoritative_id_with_fenced_metadata_and_terminal_writes():
+    operation_id = "00000000-0000-0000-0000-000000000076"
+    connection = _transactional_connection()
+    connection.fetchrow.side_effect = [
+        {"status": "processing", "worker_id": "worker-test", "claim_token": CLAIM_TOKEN},
+        {"operation_id": operation_id},
+    ]
+    connection.execute.return_value = "UPDATE 1"
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(return_value=_ConnectionBackend(connection))
+    memory._webhook_manager = None
+    memory._http_client = MagicMock()
+    memory._maybe_update_parent_operation = AsyncMock(return_value=None)
+    response = MagicMock(status_code=204, text="accepted")
+    response.raise_for_status.return_value = None
+    memory._http_client.post = AsyncMock(return_value=response)
+
+    await memory.execute_task(_claimed_webhook_task(operation_id))
+
+    metadata_sql, _operation_id, _metadata, worker_id, claim_token = connection.execute.await_args.args
+    assert "status = 'processing'" in metadata_sql
+    assert "worker_id = $3" in metadata_sql
+    assert "claim_token = $4" in metadata_sql
+    assert worker_id == "worker-test"
+    assert claim_token == CLAIM_TOKEN
+
+    terminal_sql, _operation_id, worker_id, claim_token = connection.fetchrow.await_args_list[1].args
+    assert "status = 'processing'" in terminal_sql
+    assert "worker_id = $2" in terminal_sql
+    assert "claim_token = $3" in terminal_sql
+    assert worker_id == "worker-test"
+    assert claim_token == CLAIM_TOKEN
+    memory._maybe_update_parent_operation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_claimed_webhook_payload_id_mismatch_is_rejected_before_http_side_effect():
+    claimed_operation_id = "00000000-0000-0000-0000-000000000075"
+    task = _claimed_webhook_task(claimed_operation_id)
+    task["operation_id"] = "00000000-0000-0000-0000-000000000074"
+    memory = _claimed_webhook_memory()
+    memory._http_client.post = AsyncMock()
+
+    with pytest.raises(OperationPayloadIntegrityError, match="does not match"):
+        await memory.execute_task(task)
+
+    memory._http_client.post.assert_not_awaited()
+    memory._update_webhook_delivery_metadata.assert_not_awaited()
 
 
 def test_saturation_timeout_is_explicit_bounded_config(monkeypatch):
@@ -936,44 +1186,103 @@ async def test_partial_claim_release_is_fenced_to_exact_worker_and_processing_ro
         operation_id="00000000-0000-0000-0000-000000000086",
         task_dict={},
         schema="tenant_a",
+        claim_token=CLAIM_TOKEN,
     )
 
     await poller._release_claimed_tasks([task])
 
-    sql, operation_id, worker_id = connection.execute.await_args.args
+    sql, operation_id, worker_id, claim_token = connection.execute.await_args.args
     assert "status = 'processing'" in sql
     assert "worker_id = $2" in sql
+    assert "claim_token = $3" in sql
     assert operation_id == task.operation_id
     assert worker_id == "worker-test"
+    assert claim_token == CLAIM_TOKEN
+
+
+@pytest.mark.parametrize(
+    ("method_name", "transition_args"),
+    [
+        ("_mark_completed", ()),
+        ("_mark_failed", ("provider failed",)),
+        ("_schedule_retry", ("later", "provider unavailable")),
+        ("_defer_operation", ("later", "backpressure")),
+    ],
+)
+@pytest.mark.asyncio
+async def test_same_worker_aba_poller_transition_update_zero_fails_closed(method_name, transition_args):
+    connection = _transactional_connection()
+    connection.execute.return_value = "UPDATE 0"
+    poller = WorkerPoller(
+        backend=_ConnectionBackend(connection),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+    operation_id = "00000000-0000-0000-0000-000000000079"
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
+        await getattr(poller, method_name)(operation_id, *transition_args, None, CLAIM_TOKEN)
+
+    sql, *args = connection.execute.await_args.args
+    assert "status = 'processing'" in sql
+    assert "worker_id" in sql and "claim_token" in sql
+    assert args[-2:] == ["worker-test", CLAIM_TOKEN]
 
 
 @pytest.mark.asyncio
-async def test_partial_claim_release_rejects_zero_row_authority_update():
-    connection = MagicMock()
-    connection.execute = AsyncMock(return_value="UPDATE 0")
-    transaction = AsyncMock()
-    transaction.__aenter__.return_value = None
-    transaction.__aexit__.return_value = False
-    connection.transaction.return_value = transaction
-    context = AsyncMock()
-    context.__aenter__.return_value = connection
-    context.__aexit__.return_value = False
-    backend = MagicMock()
-    backend.acquire.return_value = context
+async def test_same_worker_aba_partial_release_update_zero_fails_closed():
+    connection = _transactional_connection()
+    connection.execute.return_value = "UPDATE 0"
     poller = WorkerPoller(
-        backend=backend,
+        backend=_ConnectionBackend(connection),
         worker_id="worker-test",
         executor=AsyncMock(),
         tenant_extension=MagicMock(),
     )
     task = ClaimedTask(
-        operation_id="00000000-0000-0000-0000-000000000080",
+        operation_id="00000000-0000-0000-0000-000000000078",
         task_dict={},
-        schema="tenant_a",
+        schema=None,
+        claim_token=CLAIM_TOKEN,
     )
 
-    with pytest.raises(RuntimeError, match="could not release partial claim"):
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
         await poller._release_claimed_tasks([task])
+
+    sql, _operation_id, worker_id, claim_token = connection.execute.await_args.args
+    assert "status = 'processing'" in sql
+    assert "claim_token = $3" in sql
+    assert worker_id == "worker-test"
+    assert claim_token == CLAIM_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_same_worker_aba_recovery_update_zero_fails_closed():
+    connection = _transactional_connection()
+    connection.fetch.return_value = [
+        {
+            "operation_id": "00000000-0000-0000-0000-000000000077",
+            "claim_token": CLAIM_TOKEN,
+        }
+    ]
+    connection.execute.return_value = "UPDATE 0"
+    poller = WorkerPoller(
+        backend=_ConnectionBackend(connection),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+    poller._recover_batch_operations = AsyncMock(return_value=0)
+
+    with pytest.raises(OperationQueueAuthorityError, match="claim generation"):
+        await poller._recover_schema_tasks(None)
+
+    sql, _operation_id, worker_id, claim_token = connection.execute.await_args.args
+    assert "status = 'processing'" in sql
+    assert "claim_token = $3" in sql
+    assert worker_id == "worker-test"
+    assert claim_token == CLAIM_TOKEN
 
 
 @pytest.mark.asyncio
@@ -1188,9 +1497,11 @@ async def test_real_terminal_helper_failure_drops_health_during_claim_and_fails_
             "operation_id": operation_id,
             "bank_id": "bank-test",
             "_worker_id": "worker-test",
+            "_claim_token": CLAIM_TOKEN,
             "_operation_id": operation_id,
         },
         schema=None,
+        claim_token=CLAIM_TOKEN,
     )
 
     poller = WorkerPoller(

@@ -22,9 +22,11 @@ from ...extensions.memory_defense import (
     apply_redaction,
     parse_policy,
 )
+from ...worker.exceptions import OperationQueueAuthorityError
 from ...worker.stage import set_stage
 from ..db_utils import acquire_with_retry
 from ..memory_engine import count_tokens, fq_table
+from ..queue_claim import queue_claim_predicate, require_guarded_row, require_guarded_update
 from . import bank_utils
 
 
@@ -48,6 +50,82 @@ class MemoryDefenseAllBlockedError(Exception):
 def utcnow():
     """Get current UTC time."""
     return datetime.now(UTC)
+
+
+async def _read_operation_metadata(pool: Any, operation_id: str, action: str) -> Any:
+    """Read recovery metadata only from the bound worker claim generation."""
+
+    async with acquire_with_retry(pool) as conn:
+        claim_predicate, claim_args = queue_claim_predicate(2)
+        row = await conn.fetchrow(
+            f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1{claim_predicate}",
+            uuid.UUID(operation_id),
+            *claim_args,
+        )
+        require_guarded_row(row, operation_id, action)
+        return row
+
+
+async def _persist_operation_document_id(pool: Any, operation_id: str, document_id: str) -> None:
+    """Persist one document id without allowing a stale worker to write."""
+
+    async with acquire_with_retry(pool) as conn:
+        claim_predicate, claim_args = queue_claim_predicate(3)
+        result = await conn.execute(
+            f"""
+            UPDATE {fq_table("async_operations")}
+            SET result_metadata = jsonb_set(
+                COALESCE(result_metadata, '{{}}'::jsonb),
+                '{{document_ids}}',
+                CASE
+                    WHEN COALESCE(result_metadata->'document_ids', '[]'::jsonb) @> $1::jsonb
+                        THEN result_metadata->'document_ids'
+                    ELSE COALESCE(result_metadata->'document_ids', '[]'::jsonb) || $1::jsonb
+                END,
+                true
+            ),
+            updated_at = now()
+            WHERE operation_id = $2{claim_predicate}
+            """,
+            json.dumps([document_id]),
+            uuid.UUID(operation_id),
+            *claim_args,
+        )
+        require_guarded_update(result, operation_id, "persist document id for")
+
+
+async def _persist_facts_committed_checkpoint(
+    pool: Any,
+    operation_id: str,
+    document_id: str,
+    unit_ids_count: int,
+) -> None:
+    """Fence the crash-recovery checkpoint to the exact worker generation."""
+
+    async with acquire_with_retry(pool) as conn:
+        claim_predicate, claim_args = queue_claim_predicate(4)
+        result = await conn.execute(
+            f"""
+            UPDATE {fq_table("async_operations")}
+            SET result_metadata = jsonb_set(
+                result_metadata || $1::jsonb,
+                '{{facts_committed_document_ids}}',
+                CASE
+                    WHEN COALESCE(result_metadata->'facts_committed_document_ids', '[]'::jsonb) @> $2::jsonb
+                        THEN result_metadata->'facts_committed_document_ids'
+                    ELSE COALESCE(result_metadata->'facts_committed_document_ids', '[]'::jsonb) || $2::jsonb
+                END,
+                true
+            ),
+            updated_at = now()
+            WHERE operation_id = $3{claim_predicate}
+            """,
+            json.dumps({"facts_committed": True, "unit_ids_count": unit_ids_count}),
+            json.dumps([document_id]),
+            uuid.UUID(operation_id),
+            *claim_args,
+        )
+        require_guarded_update(result, operation_id, "save facts-committed checkpoint for")
 
 
 def _redact_document_body(body: str, config: Any) -> str:
@@ -770,20 +848,18 @@ async def retain_batch(
             effective_doc_id = doc_ids.pop()
     if not effective_doc_id and operation_id:
         try:
-            async with acquire_with_retry(pool) as conn:
-                row = await conn.fetchrow(
-                    f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
-                    uuid.UUID(operation_id),
+            row = await _read_operation_metadata(pool, operation_id, "recover document id for")
+            if row and row["result_metadata"]:
+                meta = (
+                    row["result_metadata"]
+                    if isinstance(row["result_metadata"], dict)
+                    else json.loads(row["result_metadata"])
                 )
-                if row and row["result_metadata"]:
-                    meta = (
-                        row["result_metadata"]
-                        if isinstance(row["result_metadata"], dict)
-                        else json.loads(row["result_metadata"])
-                    )
-                    recovered = meta.get("document_ids") or []
-                    if recovered:
-                        effective_doc_id = recovered[0]
+                recovered = meta.get("document_ids") or []
+                if recovered:
+                    effective_doc_id = recovered[0]
+        except OperationQueueAuthorityError:
+            raise
         except Exception:
             pass
     if not effective_doc_id:
@@ -794,26 +870,9 @@ async def retain_batch(
     # it touched, and lets retries reuse the same generated id.
     if operation_id:
         try:
-            async with acquire_with_retry(pool) as conn:
-                await conn.execute(
-                    f"""
-                    UPDATE {fq_table("async_operations")}
-                    SET result_metadata = jsonb_set(
-                        COALESCE(result_metadata, '{{}}'::jsonb),
-                        '{{document_ids}}',
-                        CASE
-                            WHEN COALESCE(result_metadata->'document_ids', '[]'::jsonb) @> $1::jsonb
-                                THEN result_metadata->'document_ids'
-                            ELSE COALESCE(result_metadata->'document_ids', '[]'::jsonb) || $1::jsonb
-                        END,
-                        true
-                    ),
-                    updated_at = now()
-                    WHERE operation_id = $2
-                    """,
-                    json.dumps([effective_doc_id]),
-                    uuid.UUID(operation_id),
-                )
+            await _persist_operation_document_id(pool, operation_id, effective_doc_id)
+        except OperationQueueAuthorityError:
+            raise
         except Exception:
             logger.warning("Failed to persist document_id", exc_info=True)
 
@@ -1317,6 +1376,8 @@ async def _streaming_retain_batch(
                     total=total_chunks,
                     detail={"facts_committed": len(all_unit_ids)},
                 )
+            except OperationQueueAuthorityError:
+                raise
             except Exception:
                 logger.debug("retain chunk-progress write failed", exc_info=True)
 
@@ -1657,33 +1718,31 @@ async def _streaming_retain_batch(
     facts_already_committed = False
     if operation_id and chunk_index_offset == 0:
         try:
-            async with acquire_with_retry(pool) as conn:
-                row = await conn.fetchrow(
-                    f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
-                    uuid.UUID(operation_id),
+            row = await _read_operation_metadata(pool, operation_id, "recover facts checkpoint for")
+            if row and row["result_metadata"]:
+                meta = (
+                    row["result_metadata"]
+                    if isinstance(row["result_metadata"], dict)
+                    else json.loads(row["result_metadata"])
                 )
-                if row and row["result_metadata"]:
-                    meta = (
-                        row["result_metadata"]
-                        if isinstance(row["result_metadata"], dict)
-                        else json.loads(row["result_metadata"])
+                committed_doc_ids = meta.get("facts_committed_document_ids") or []
+                document_ids = meta.get("document_ids") or []
+                # Legacy path: operations created before per-document checkpoint
+                # tracking only wrote facts_committed=true without document IDs.
+                # Treat those as committed only for single-doc operations.
+                legacy_single_doc_checkpoint = (
+                    meta.get("facts_committed")
+                    and not committed_doc_ids
+                    and (len(document_ids) <= 1 or document_ids == [effective_doc_id])
+                )
+                if effective_doc_id in committed_doc_ids or legacy_single_doc_checkpoint:
+                    facts_already_committed = True
+                    log_buffer.append(
+                        f"[streaming] Recovery: facts already committed ({meta.get('unit_ids_count', '?')} units), "
+                        f"skipping to final ANN pass"
                     )
-                    committed_doc_ids = meta.get("facts_committed_document_ids") or []
-                    document_ids = meta.get("document_ids") or []
-                    # Legacy path: operations created before per-document checkpoint
-                    # tracking only wrote facts_committed=true without document IDs.
-                    # Treat those as committed only for single-doc operations.
-                    legacy_single_doc_checkpoint = (
-                        meta.get("facts_committed")
-                        and not committed_doc_ids
-                        and (len(document_ids) <= 1 or document_ids == [effective_doc_id])
-                    )
-                    if effective_doc_id in committed_doc_ids or legacy_single_doc_checkpoint:
-                        facts_already_committed = True
-                        log_buffer.append(
-                            f"[streaming] Recovery: facts already committed ({meta.get('unit_ids_count', '?')} units), "
-                            f"skipping to final ANN pass"
-                        )
+        except OperationQueueAuthorityError:
+            raise
         except Exception:
             logger.warning("Failed to check operation recovery state", exc_info=True)
 
@@ -1743,31 +1802,18 @@ async def _streaming_retain_batch(
         # Mark facts as committed in operation metadata (crash recovery checkpoint)
         if operation_id and all_unit_ids:
             try:
-                async with acquire_with_retry(pool) as conn:
-                    # Append effective_doc_id to the committed document set if not
-                    # already present, so multi-doc batches track each document
-                    # independently for crash recovery.
-                    await conn.execute(
-                        f"""
-                        UPDATE {fq_table("async_operations")}
-                        SET result_metadata = jsonb_set(
-                            result_metadata || $1::jsonb,
-                            '{{facts_committed_document_ids}}',
-                            CASE
-                                WHEN COALESCE(result_metadata->'facts_committed_document_ids', '[]'::jsonb) @> $2::jsonb
-                                    THEN result_metadata->'facts_committed_document_ids'
-                                ELSE COALESCE(result_metadata->'facts_committed_document_ids', '[]'::jsonb) || $2::jsonb
-                            END,
-                            true
-                        ),
-                        updated_at = now()
-                        WHERE operation_id = $3
-                        """,
-                        json.dumps({"facts_committed": True, "unit_ids_count": len(all_unit_ids)}),
-                        json.dumps([effective_doc_id]),
-                        uuid.UUID(operation_id),
-                    )
+                # Append effective_doc_id to the committed document set if not
+                # already present, so multi-doc batches track each document
+                # independently for crash recovery.
+                await _persist_facts_committed_checkpoint(
+                    pool,
+                    operation_id,
+                    effective_doc_id,
+                    len(all_unit_ids),
+                )
                 log_buffer.append(f"[streaming] Checkpoint: {len(all_unit_ids)} facts committed, ANN pass next")
+            except OperationQueueAuthorityError:
+                raise
             except Exception:
                 logger.warning("Failed to save facts_committed checkpoint", exc_info=True)
     else:

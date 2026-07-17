@@ -505,6 +505,7 @@ class DataAccessOps(ABC):
         conn: DatabaseConnection,
         table: str,
         worker_id: str,
+        claim_token: str,
         reserved_limits: dict[str, int],
         shared_limit: int,
         *,
@@ -517,6 +518,8 @@ class DataAccessOps(ABC):
         claim excluding them) to avoid ORA-02014.
 
         Args:
+            claim_token: Fresh generation token persisted on every row in this
+                atomic claim batch. A later claim must use a different token.
             consolidation_bank_priority: Per-bank priority for consolidation scheduling.
                 Maps bank name patterns to integer priorities (higher = claimed first).
                 Patterns support ``*`` as wildcard (converted to SQL ``%`` for LIKE).

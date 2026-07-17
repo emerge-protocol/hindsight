@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 from ..llm_interface import ProviderRateLimitResetError
 from ..llm_wrapper import LLMConfig, OutputTooLongError, sanitize_llm_output
 from ..operation_metadata import RetainExtractionErrors
+from ..queue_claim import queue_claim_predicate, require_guarded_row, require_guarded_update
 from ..response_models import TokenUsage
 from .entity_labels import (
     EntityLabelsConfig,
@@ -1868,6 +1869,52 @@ logger = logging.getLogger(__name__)
 SECONDS_PER_FACT = 0.01
 
 
+async def _read_batch_operation_metadata(
+    pool: Any,
+    table: str,
+    operation_id: str,
+    action: str,
+) -> Any:
+    """Read batch recovery state only from the bound worker generation."""
+
+    from ..db_utils import acquire_with_retry
+
+    async with acquire_with_retry(pool) as conn:
+        claim_predicate, claim_args = queue_claim_predicate(2)
+        row = await conn.fetchrow(
+            f"SELECT result_metadata FROM {table} WHERE operation_id = $1{claim_predicate}",
+            operation_id,
+            *claim_args,
+        )
+        require_guarded_row(row, operation_id, action)
+        return row
+
+
+async def _write_batch_operation_state(
+    pool: Any,
+    table: str,
+    operation_id: str,
+    batch_state: dict[str, Any],
+) -> None:
+    """Persist submitted provider batch state under the exact worker claim."""
+
+    from ..db_utils import acquire_with_retry
+
+    async with acquire_with_retry(pool) as conn:
+        claim_predicate, claim_args = queue_claim_predicate(3)
+        result = await conn.execute(
+            f"""
+            UPDATE {table}
+            SET result_metadata = result_metadata || $1::jsonb, updated_at = now()
+            WHERE operation_id = $2{claim_predicate}
+            """,
+            json.dumps(batch_state),
+            operation_id,
+            *claim_args,
+        )
+        require_guarded_update(result, operation_id, "save provider batch state for")
+
+
 async def _write_batch_extraction_errors(
     pool: Any,
     operation_id: str | None,
@@ -1889,16 +1936,19 @@ async def _write_batch_extraction_errors(
     # unrelated keys (e.g. batch_id) already on result_metadata.
     table = fq_table("async_operations", schema)
     async with acquire_with_retry(pool) as conn:
-        await conn.execute(
+        claim_predicate, claim_args = queue_claim_predicate(3)
+        result = await conn.execute(
             f"""
             UPDATE {table}
             SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb,
                 updated_at = now()
-            WHERE operation_id = $1
+            WHERE operation_id = $1{claim_predicate}
             """,
             operation_id,
             json.dumps(errors.to_dict()),
+            *claim_args,
         )
+        require_guarded_update(result, operation_id, "write batch extraction errors for")
 
 
 async def extract_facts_from_contents_batch_api(
@@ -1947,15 +1997,10 @@ async def extract_facts_from_contents_batch_api(
     # Check if we're resuming an existing batch (crash recovery)
     batch_id = None
     if operation_id and pool:
-        from ..db_utils import acquire_with_retry
         from ..task_backend import fq_table
 
         table = fq_table("async_operations", schema)
-        async with acquire_with_retry(pool) as conn:
-            row = await conn.fetchrow(
-                f"SELECT result_metadata FROM {table} WHERE operation_id = $1",
-                operation_id,
-            )
+        row = await _read_batch_operation_metadata(pool, table, operation_id, "recover provider batch state for")
 
         if row and row["result_metadata"]:
             metadata = row["result_metadata"]
@@ -2012,6 +2057,13 @@ async def extract_facts_from_contents_batch_api(
     if not batch_id:
         logger.info(f"Submitting batch with {len(batch_requests)} chunk requests")
 
+        # Request construction can be expensive. Re-attest immediately before
+        # the non-transactional provider submit so a transferred claim cannot
+        # launch a new external batch. The post-submit state write below is
+        # independently fenced and fails closed if authority moves in flight.
+        if operation_id and pool:
+            await _read_batch_operation_metadata(pool, table, operation_id, "submit provider batch for")
+
         batch_metadata = await llm_config._provider_impl.submit_batch(batch_requests)
         batch_id = batch_metadata["batch_id"]
 
@@ -2026,21 +2078,7 @@ async def extract_facts_from_contents_batch_api(
                 "chunk_count": len(batch_requests),
             }
 
-            # Update operation result_metadata
-            from ..db_utils import acquire_with_retry
-            from ..task_backend import fq_table
-
-            table = fq_table("async_operations", schema)
-            async with acquire_with_retry(pool) as conn:
-                await conn.execute(
-                    f"""
-                    UPDATE {table}
-                    SET result_metadata = result_metadata || $1::jsonb, updated_at = now()
-                    WHERE operation_id = $2
-                    """,
-                    json.dumps(batch_state),
-                    operation_id,
-                )
+            await _write_batch_operation_state(pool, table, operation_id, batch_state)
             logger.info(f"Stored batch state for operation {operation_id} (crash recovery enabled)")
     else:
         logger.info(f"Resuming polling for existing batch: {batch_id}")
@@ -2051,6 +2089,8 @@ async def extract_facts_from_contents_batch_api(
     start_time = time.time()
     while True:
         status_info = await llm_config._provider_impl.get_batch_status(batch_id)
+        if operation_id and pool:
+            await _read_batch_operation_metadata(pool, table, operation_id, "poll provider batch for")
         status = status_info["status"]
 
         elapsed = time.time() - start_time
@@ -2073,6 +2113,8 @@ async def extract_facts_from_contents_batch_api(
 
     # Step 4: Retrieve results
     batch_results = await llm_config._provider_impl.retrieve_batch_results(batch_id)
+    if operation_id and pool:
+        await _read_batch_operation_metadata(pool, table, operation_id, "consume provider batch results for")
 
     # Map results by custom_id
     results_by_id = {result["custom_id"]: result for result in batch_results}

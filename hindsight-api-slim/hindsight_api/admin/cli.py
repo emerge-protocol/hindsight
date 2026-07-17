@@ -482,10 +482,21 @@ async def _decommission_worker(db_url: str, worker_id: str, schema: str = "publi
         table = _fq_table("async_operations", schema)
         result = await conn.fetch(
             f"""
-            UPDATE {table}
-            SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-            WHERE worker_id = $1 AND status = 'processing'
-            RETURNING operation_id
+            WITH claimed AS (
+                SELECT operation_id, worker_id, claim_token
+                FROM {table}
+                WHERE worker_id = $1 AND status = 'processing'
+                FOR UPDATE
+            )
+            UPDATE {table} AS operations
+            SET status = 'pending', worker_id = NULL, claim_token = NULL,
+                claimed_at = NULL, updated_at = now()
+            FROM claimed
+            WHERE operations.operation_id = claimed.operation_id
+              AND operations.status = 'processing'
+              AND operations.worker_id = claimed.worker_id
+              AND operations.claim_token IS NOT DISTINCT FROM claimed.claim_token
+            RETURNING operations.operation_id
             """,
             worker_id,
         )
@@ -541,10 +552,21 @@ async def _decommission_all_workers(db_url: str, schema: str = "public") -> list
         table = _fq_table("async_operations", schema)
         rows = await conn.fetch(
             f"""
-            UPDATE {table}
-            SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-            WHERE status = 'processing'
-            RETURNING operation_id, worker_id, operation_type
+            WITH claimed AS (
+                SELECT operation_id, worker_id, operation_type, claim_token
+                FROM {table}
+                WHERE status = 'processing'
+                FOR UPDATE
+            )
+            UPDATE {table} AS operations
+            SET status = 'pending', worker_id = NULL, claim_token = NULL,
+                claimed_at = NULL, updated_at = now()
+            FROM claimed
+            WHERE operations.operation_id = claimed.operation_id
+              AND operations.status = 'processing'
+              AND operations.worker_id = claimed.worker_id
+              AND operations.claim_token IS NOT DISTINCT FROM claimed.claim_token
+            RETURNING operations.operation_id, claimed.worker_id, claimed.operation_type
             """,
         )
         return [dict(r) for r in rows]

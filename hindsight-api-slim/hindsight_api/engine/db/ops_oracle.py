@@ -1071,6 +1071,7 @@ class OracleOps(DataAccessOps):
         conn,
         table,
         worker_id,
+        claim_token,
         reserved_limits,
         shared_limit,
         *,
@@ -1193,14 +1194,19 @@ class OracleOps(DataAccessOps):
 
         # Mark all claimed rows as processing
         operation_ids = [row["operation_id"] for row in all_rows]
-        await conn.execute(
+        update_result = await conn.execute(
             f"""
             UPDATE {table}
-            SET status = 'processing', worker_id = $1, claimed_at = now(), updated_at = now()
-            WHERE operation_id = ANY($2)
+            SET status = 'processing', worker_id = $1, claim_token = $2,
+                claimed_at = now(), updated_at = now()
+            WHERE operation_id = ANY($3) AND status = 'pending'
             """,
             worker_id,
+            claim_token,
             operation_ids,
         )
+        updated = int(update_result.rsplit(maxsplit=1)[-1]) if update_result else 0
+        if updated != len(operation_ids):
+            raise RuntimeError(f"Claimed {len(operation_ids)} locked tasks but persisted {updated} claim generations")
 
         return all_rows

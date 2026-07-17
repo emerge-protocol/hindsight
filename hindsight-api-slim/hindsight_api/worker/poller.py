@@ -14,6 +14,7 @@ import json
 import logging
 import time
 import traceback
+import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..engine.schema import fq_table_explicit as fq_table
 from ..metrics import get_metrics_collector
-from .exceptions import DeferOperation, OperationTerminalStateError, RetryTaskAt
+from .exceptions import DeferOperation, OperationQueueAuthorityError, OperationTerminalStateError, RetryTaskAt
 from .stage import StageHolder, bind_holder
 
 # Map DB operation_type -> metric `operation` label, collapsing the retain
@@ -47,8 +48,14 @@ class WorkerPartialClaimReleaseError(RuntimeError):
     """Committed claims could not be released after a later schema failed."""
 
 
+def _metric_operation_label(operation_type: str | None) -> str:
+    if operation_type in _RETAIN_OP_TYPES:
+        return "retain"
+    return operation_type or "unknown"
+
+
 def _command_row_count(result: str | None) -> int:
-    """Parse a backend's PostgreSQL-compatible command status."""
+    """Parse the PG-compatible command status returned by every backend."""
 
     if not result:
         return 0
@@ -56,12 +63,6 @@ def _command_row_count(result: str | None) -> int:
         return int(result.rsplit(maxsplit=1)[-1])
     except (TypeError, ValueError):
         return 0
-
-
-def _metric_operation_label(operation_type: str | None) -> str:
-    if operation_type in _RETAIN_OP_TYPES:
-        return "retain"
-    return operation_type or "unknown"
 
 
 if TYPE_CHECKING:
@@ -142,6 +143,7 @@ class ClaimedTask:
     operation_id: str
     task_dict: dict[str, Any]
     schema: str | None
+    claim_token: str | None = None
 
 
 @dataclass
@@ -240,8 +242,8 @@ class WorkerPoller:
 
         self._optional_routines = OptionalRoutines(self._backend)
         self._shutdown = asyncio.Event()
-        # Set while no claim can still return untracked work. Graceful
-        # shutdown waits on this boundary before inspecting active tasks.
+        # Set while no claim can still return untracked work. Graceful shutdown
+        # waits on this boundary before inspecting or draining active tasks.
         self._claim_cycle_done = asyncio.Event()
         self._claim_cycle_done.set()
         # Readiness covers both startup recovery and the live polling path.  It
@@ -539,13 +541,14 @@ class WorkerPoller:
             if all_tasks:
                 # Claims commit independently per tenant schema. If a later
                 # schema fails, release every earlier claim before surfacing
-                # the unavailable poll; otherwise processing rows can become
-                # invisible to this process forever.
+                # the unavailable poll; otherwise a transient failure can
+                # leave processing rows invisible to this process forever.
                 try:
                     await self._release_claimed_tasks(all_tasks)
                 except Exception as release_error:
-                    # Exit immediately so startup recovery can release the
-                    # exact-worker rows instead of restoring false readiness.
+                    # Do not let a later successful poll restore readiness
+                    # while these exact-worker rows remain processing. Exit
+                    # immediately so startup recovery releases them.
                     raise WorkerPartialClaimReleaseError(
                         f"Worker {self._worker_id} could not release a partial cross-schema claim batch"
                     ) from release_error
@@ -584,20 +587,26 @@ class WorkerPoller:
             async with self._backend.acquire() as conn:
                 async with conn.transaction():
                     for task in schema_tasks:
+                        if not task.claim_token:
+                            raise OperationQueueAuthorityError(
+                                f"Partial claim {task.operation_id} has no claim-generation token"
+                            )
                         result = await conn.execute(
                             f"""
                             UPDATE {table}
-                            SET status = 'pending', worker_id = NULL,
+                            SET status = 'pending', worker_id = NULL, claim_token = NULL,
                                 claimed_at = NULL, updated_at = now()
                             WHERE operation_id = $1 AND status = 'processing'
-                              AND worker_id = $2
+                              AND worker_id = $2 AND claim_token = $3
                             """,
                             task.operation_id,
                             self._worker_id,
+                            task.claim_token,
                         )
-                        if _command_row_count(result) != 1:
-                            raise RuntimeError(
-                                f"Worker {self._worker_id} could not release partial claim {task.operation_id}"
+                        updated = int(result.split()[-1]) if result else 0
+                        if updated != 1:
+                            raise OperationQueueAuthorityError(
+                                f"Worker {self._worker_id} lost claim generation while releasing {task.operation_id}"
                             )
 
     async def _claim_batch_for_schema_inner(
@@ -609,6 +618,7 @@ class WorkerPoller:
         handles backend-specific differences (e.g. Oracle's ORA-02014 workaround).
         """
         table = fq_table("async_operations", schema)
+        claim_token = uuid.uuid4().hex
 
         async with self._backend.acquire() as conn:
             async with conn.transaction():
@@ -616,6 +626,7 @@ class WorkerPoller:
                     conn,
                     table,
                     self._worker_id,
+                    claim_token,
                     reserved_limits,
                     shared_limit,
                     consolidation_bank_priority=self._consolidation_bank_priority,
@@ -635,6 +646,7 @@ class WorkerPoller:
                     # task/provider side effects. Keep it internal to the
                     # in-process executor payload.
                     task_dict["_worker_id"] = self._worker_id
+                    task_dict["_claim_token"] = claim_token
                     # The DB column is authoritative for operation_type — inject it
                     # into task_dict so in-flight tracking and slot accounting work.
                     db_op_type = row["operation_type"]
@@ -645,24 +657,39 @@ class WorkerPoller:
                             operation_id=str(row["operation_id"]),
                             task_dict=task_dict,
                             schema=schema,
+                            claim_token=claim_token,
                         )
                     )
                 return result
 
-    async def _mark_completed(self, operation_id: str, schema: str | None):
+    async def _mark_completed(self, operation_id: str, schema: str | None, claim_token: str | None = None):
         """Mark a task as completed."""
         table = fq_table("async_operations", schema)
+        claim_predicate = ""
+        claim_args: tuple[str, ...] = ()
+        if claim_token:
+            claim_predicate = " AND status = 'processing' AND worker_id = $2 AND claim_token = $3"
+            claim_args = (self._worker_id, claim_token)
         async with self._backend.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 f"""
                 UPDATE {table}
                 SET status = 'completed', completed_at = now(), updated_at = now()
-                WHERE operation_id = $1
+                WHERE operation_id = $1{claim_predicate}
                 """,
                 operation_id,
+                *claim_args,
             )
+        if claim_token and _command_row_count(result) != 1:
+            raise OperationQueueAuthorityError(f"Lost queue claim generation while completing operation {operation_id}")
 
-    async def _mark_failed(self, operation_id: str, error_message: str, schema: str | None):
+    async def _mark_failed(
+        self,
+        operation_id: str,
+        error_message: str,
+        schema: str | None,
+        claim_token: str | None = None,
+    ):
         """Mark a task as failed with error message, then propagate to parent if applicable."""
         table = fq_table("async_operations", schema)
         # Truncate error message if too long (max 5000 chars in schema)
@@ -670,15 +697,25 @@ class WorkerPoller:
 
         async with self._backend.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(
+                claim_predicate = ""
+                claim_args: tuple[str, ...] = ()
+                if claim_token:
+                    claim_predicate = " AND status = 'processing' AND worker_id = $3 AND claim_token = $4"
+                    claim_args = (self._worker_id, claim_token)
+                result = await conn.execute(
                     f"""
                     UPDATE {table}
                     SET status = 'failed', error_message = $2, completed_at = now(), updated_at = now()
-                    WHERE operation_id = $1
+                    WHERE operation_id = $1{claim_predicate}
                     """,
                     operation_id,
                     error_message,
+                    *claim_args,
                 )
+                if claim_token and _command_row_count(result) != 1:
+                    raise OperationQueueAuthorityError(
+                        f"Lost queue claim generation while failing operation {operation_id}"
+                    )
                 await self._maybe_update_parent_operation(operation_id, schema, conn)
 
     async def _maybe_update_parent_operation(self, child_operation_id: str, schema: str | None, conn) -> None:
@@ -769,42 +806,74 @@ class WorkerPoller:
             # terminal child while silently stranding its parent.
             raise
 
-    async def _schedule_retry(self, operation_id: str, retry_at: "Any", error_message: str, schema: str | None):
+    async def _schedule_retry(
+        self,
+        operation_id: str,
+        retry_at: "Any",
+        error_message: str,
+        schema: str | None,
+        claim_token: str | None = None,
+    ):
         """Reset task to pending with a future retry timestamp."""
         table = fq_table("async_operations", schema)
         error_message = error_message[:5000] if len(error_message) > 5000 else error_message
+        claim_predicate = ""
+        claim_args: tuple[str, ...] = ()
+        if claim_token:
+            claim_predicate = " AND status = 'processing' AND worker_id = $4 AND claim_token = $5"
+            claim_args = (self._worker_id, claim_token)
         async with self._backend.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 f"""
                 UPDATE {table}
-                SET status = 'pending', next_retry_at = $2, worker_id = NULL, claimed_at = NULL,
+                SET status = 'pending', next_retry_at = $2, worker_id = NULL, claim_token = NULL, claimed_at = NULL,
                     retry_count = retry_count + 1, error_message = $3, updated_at = now()
-                WHERE operation_id = $1
+                WHERE operation_id = $1{claim_predicate}
                 """,
                 operation_id,
                 retry_at,
                 error_message,
+                *claim_args,
+            )
+        if claim_token and _command_row_count(result) != 1:
+            raise OperationQueueAuthorityError(
+                f"Lost queue claim generation while scheduling retry for operation {operation_id}"
             )
         logger.warning(f"Task {operation_id} scheduled for retry at {retry_at}: {error_message}")
 
-    async def _defer_operation(self, operation_id: str, exec_date: "Any", reason: str, schema: str | None):
+    async def _defer_operation(
+        self,
+        operation_id: str,
+        exec_date: "Any",
+        reason: str,
+        schema: str | None,
+        claim_token: str | None = None,
+    ):
         """Reset task to pending for re-pickup at exec_date without counting as a retry.
 
         Unlike `_schedule_retry`, this does not bump `retry_count` and does not
         populate `error_message` — defer is intentional backpressure, not a failure.
         """
         table = fq_table("async_operations", schema)
+        claim_predicate = ""
+        claim_args: tuple[str, ...] = ()
+        if claim_token:
+            claim_predicate = " AND status = 'processing' AND worker_id = $3 AND claim_token = $4"
+            claim_args = (self._worker_id, claim_token)
         async with self._backend.acquire() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 f"""
                 UPDATE {table}
-                SET status = 'pending', next_retry_at = $2, worker_id = NULL, claimed_at = NULL,
+                SET status = 'pending', next_retry_at = $2, worker_id = NULL, claim_token = NULL, claimed_at = NULL,
                     updated_at = now()
-                WHERE operation_id = $1
+                WHERE operation_id = $1{claim_predicate}
                 """,
                 operation_id,
                 exec_date,
+                *claim_args,
             )
+        if claim_token and _command_row_count(result) != 1:
+            raise OperationQueueAuthorityError(f"Lost queue claim generation while deferring operation {operation_id}")
         logger.info(f"Task {operation_id} deferred until {exec_date}: {reason}")
 
     async def execute_task(self, task: ClaimedTask):
@@ -954,6 +1023,17 @@ class WorkerPoller:
         try:
             schema_info = f", schema={task.schema}" if task.schema else ""
             logger.debug(f"Executing task {task.operation_id} (type={task_type}, bank={bank_id}{schema_info})")
+            payload_worker_id = task.task_dict.get("_worker_id")
+            payload_claim_token = task.task_dict.get("_claim_token")
+            if task.claim_token is not None or payload_worker_id is not None or payload_claim_token is not None:
+                if (
+                    not task.claim_token
+                    or payload_worker_id != self._worker_id
+                    or payload_claim_token != task.claim_token
+                ):
+                    raise OperationQueueAuthorityError(
+                        f"Claim metadata changed before executing operation {task.operation_id}"
+                    )
             if task.schema:
                 task.task_dict["_schema"] = task.schema
             await self._executor(task.task_dict)
@@ -966,14 +1046,23 @@ class WorkerPoller:
             raise
         except DeferOperation as e:
             # Deferral is not a terminal outcome — do not record a completion.
-            await self._defer_operation(task.operation_id, e.exec_date, e.reason, task.schema)
+            if task.claim_token:
+                await self._defer_operation(task.operation_id, e.exec_date, e.reason, task.schema, task.claim_token)
+            else:
+                await self._defer_operation(task.operation_id, e.exec_date, e.reason, task.schema)
         except RetryTaskAt as e:
             # Retry is not a terminal outcome — do not record a completion.
-            await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)
+            if task.claim_token:
+                await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema, task.claim_token)
+            else:
+                await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)
         except Exception as e:
             logger.error(f"Task {task.operation_id} failed: {e}")
             traceback.print_exc()
-            await self._mark_failed(task.operation_id, str(e), task.schema)
+            if task.claim_token:
+                await self._mark_failed(task.operation_id, str(e), task.schema, task.claim_token)
+            else:
+                await self._mark_failed(task.operation_id, str(e), task.schema)
             terminal_success = False
 
         # Record the metric outside the executor's exception scope so a metrics
@@ -1030,17 +1119,45 @@ class WorkerPoller:
         # must succeed before this schema counts as recovered.
         recovered = await self._recover_batch_operations(schema)
         async with self._backend.acquire() as conn:
-            result = await conn.execute(
-                f"""
-                UPDATE {table}
-                SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-                WHERE status = 'processing' AND worker_id = $1 AND result_metadata->>'batch_id' IS NULL
-                """,
-                self._worker_id,
-            )
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    f"""
+                    SELECT operation_id, claim_token
+                    FROM {table}
+                    WHERE status = 'processing'
+                      AND worker_id = $1
+                      AND result_metadata->>'batch_id' IS NULL
+                    FOR UPDATE
+                    """,
+                    self._worker_id,
+                )
+                for row in rows:
+                    claim_token = row["claim_token"]
+                    token_predicate = "claim_token IS NULL"
+                    token_args: tuple[str, ...] = ()
+                    if claim_token is not None:
+                        token_predicate = "claim_token = $3"
+                        token_args = (claim_token,)
+                    result = await conn.execute(
+                        f"""
+                        UPDATE {table}
+                        SET status = 'pending', worker_id = NULL, claim_token = NULL,
+                            claimed_at = NULL, updated_at = now()
+                        WHERE operation_id = $1
+                          AND status = 'processing'
+                          AND worker_id = $2
+                          AND {token_predicate}
+                        """,
+                        row["operation_id"],
+                        self._worker_id,
+                        *token_args,
+                    )
+                    if _command_row_count(result) != 1:
+                        raise OperationQueueAuthorityError(
+                            f"Lost claim generation while recovering operation {row['operation_id']}"
+                        )
 
-        # Parse "UPDATE N" to get count.
-        return recovered + (int(result.split()[-1]) if result else 0)
+        return recovered + len(rows)
 
     async def _recover_batch_operations(self, schema: str | None) -> int:
         """
@@ -1057,65 +1174,67 @@ class WorkerPoller:
         """
         table = fq_table("async_operations", schema)
 
-        async with self._backend.acquire() as conn:
-            # Find operations with batch_id in metadata (batch API operations)
-            rows = await conn.fetch(
-                f"""
-                SELECT operation_id, task_payload, result_metadata
-                FROM {table}
-                WHERE status = 'processing'
-                  AND worker_id = $1
-                  AND result_metadata ? 'batch_id'
-                  AND task_payload IS NOT NULL
-                """,
-                self._worker_id,
-            )
-
-        if not rows:
-            return 0
-
         recovered = 0
-        for row in rows:
-            operation_id = str(row["operation_id"])
-            result_metadata = row["result_metadata"]
-
-            # Parse metadata
-            if isinstance(result_metadata, str):
-                result_metadata = json.loads(result_metadata)
-
-            batch_id = result_metadata.get("batch_id")
-            batch_provider = result_metadata.get("batch_provider", "openai")
-
-            logger.info(
-                f"Recovering batch operation: operation_id={operation_id}, batch_id={batch_id}, provider={batch_provider}"
-            )
-
-            # Mark operation as ready for re-processing.  Any failure escapes
-            # the startup gate; returning zero would strand a processing row.
-            async with self._backend.acquire() as conn:
-                result = await conn.execute(
+        async with self._backend.acquire() as conn:
+            async with conn.transaction():
+                # Lock the exact generations being recovered so a concurrent
+                # same-worker process cannot create an ABA owner collision.
+                rows = await conn.fetch(
                     f"""
-                    UPDATE {table}
-                    SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-                    WHERE operation_id = $1
-                      AND status = 'processing'
-                      AND worker_id = $2
+                    SELECT operation_id, task_payload, result_metadata, claim_token
+                    FROM {table}
+                    WHERE status = 'processing'
+                      AND worker_id = $1
                       AND result_metadata ? 'batch_id'
+                      AND task_payload IS NOT NULL
+                    FOR UPDATE
                     """,
-                    operation_id,
                     self._worker_id,
                 )
 
-            updated = int(result.split()[-1]) if result else 0
-            if updated != 1:
-                logger.info(
-                    "Batch operation %s changed owner/state during startup recovery; leaving it untouched",
-                    operation_id,
-                )
-                continue
+                for row in rows:
+                    operation_id = str(row["operation_id"])
+                    result_metadata = row["result_metadata"]
+                    if isinstance(result_metadata, str):
+                        result_metadata = json.loads(result_metadata)
 
-            recovered += updated
-            logger.info(f"Batch operation {operation_id} reset to pending for re-processing")
+                    batch_id = result_metadata.get("batch_id")
+                    batch_provider = result_metadata.get("batch_provider", "openai")
+                    logger.info(
+                        "Recovering batch operation: operation_id=%s, batch_id=%s, provider=%s",
+                        operation_id,
+                        batch_id,
+                        batch_provider,
+                    )
+
+                    claim_token = row["claim_token"]
+                    token_predicate = "claim_token IS NULL"
+                    token_args: tuple[str, ...] = ()
+                    if claim_token is not None:
+                        token_predicate = "claim_token = $3"
+                        token_args = (claim_token,)
+                    result = await conn.execute(
+                        f"""
+                        UPDATE {table}
+                        SET status = 'pending', worker_id = NULL, claim_token = NULL,
+                            claimed_at = NULL, updated_at = now()
+                        WHERE operation_id = $1
+                          AND status = 'processing'
+                          AND worker_id = $2
+                          AND {token_predicate}
+                          AND result_metadata ? 'batch_id'
+                        """,
+                        row["operation_id"],
+                        self._worker_id,
+                        *token_args,
+                    )
+                    if _command_row_count(result) != 1:
+                        raise OperationQueueAuthorityError(
+                            f"Lost claim generation while recovering batch operation {operation_id}"
+                        )
+
+                    recovered += 1
+                    logger.info(f"Batch operation {operation_id} reset to pending for re-processing")
 
         return recovered
 
@@ -1144,8 +1263,8 @@ class WorkerPoller:
                 self._raise_if_background_task_failed()
                 await self._raise_if_saturated_without_progress()
                 try:
-                    # Close the race where shutdown is requested after the
-                    # while condition but before a new claim starts.
+                    # Close the race where shutdown sets the flag after the
+                    # while condition but before a new claim begins.
                     if self._shutdown.is_set():
                         break
                     # Claim a batch of tasks (respecting slot limits).  The
@@ -1156,14 +1275,15 @@ class WorkerPoller:
                     try:
                         tasks = await self.claim_batch()
                         # A background terminal write may have failed while the
-                        # claim was in flight.  Do not spawn returned work or
+                        # claim was in flight.  Do not spawn the returned work or
                         # reassert readiness before observing that fatal state.
                         self._raise_if_background_task_failed()
 
                         if self._shutdown.is_set():
                             # Shutdown may arrive while rows are being claimed.
-                            # Return them before declaring the cycle quiescent;
-                            # no new side effect starts after that request.
+                            # Return those rows to pending before advertising a
+                            # quiescent cycle; no new provider side effect starts
+                            # after shutdown has been requested.
                             if tasks:
                                 try:
                                     await self._release_claimed_tasks(tasks)
@@ -1210,13 +1330,11 @@ class WorkerPoller:
                         self._raise_if_background_task_failed()
                         self._ready = True
                         consecutive_poll_errors = 0
-
                         # No tasks claimed (either no pending tasks or slots full)
                         # Wait before polling again
                         await self._wait_for_poll_interval_or_stop()
                     finally:
                         self._claim_cycle_done.set()
-
                 except (WorkerBackgroundTaskError, WorkerPartialClaimReleaseError, WorkerSaturationTimeoutError):
                     raise
                 except asyncio.CancelledError:
@@ -1254,8 +1372,8 @@ class WorkerPoller:
         self._shutdown.set()
 
         # A claim commits rows before returning them to the poll loop. Wait
-        # until that loop has registered or released the work before an
-        # apparent zero-task drain can succeed.
+        # until that loop has either registered the work or released it; an
+        # early zero-count observation can otherwise cancel an untracked claim.
         start_time = asyncio.get_event_loop().time()
         remaining = timeout - (asyncio.get_event_loop().time() - start_time)
         if not self._claim_cycle_done.is_set():
