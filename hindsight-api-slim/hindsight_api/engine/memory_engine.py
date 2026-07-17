@@ -41,7 +41,12 @@ from ..config import (
 )
 from ..tracing import create_operation_span
 from ..utils import mask_network_location
-from ..worker.exceptions import DeferOperation, OperationTerminalStateError, RetryTaskAt
+from ..worker.exceptions import (
+    DeferOperation,
+    OperationQueueAuthorityError,
+    OperationTerminalStateError,
+    RetryTaskAt,
+)
 from ..worker.stage import set_stage
 from .audit import AuditLogger, audit_context
 from .bank_stats_cache import BankStatsCache, DistributedBankStatsCache
@@ -1894,7 +1899,24 @@ class MemoryEngine(MemoryEngineInterface):
                       Example: {'type': 'batch_retain', 'bank_id': '...', 'contents': [...]}
         """
         task_type = task_dict.get("type")
-        operation_id = task_dict.get("operation_id")
+        expected_worker_id = task_dict.pop("_worker_id", None)
+        claimed_operation_id = task_dict.pop("_operation_id", None)
+        payload_operation_id = task_dict.get("operation_id")
+        if expected_worker_id is not None:
+            if not claimed_operation_id:
+                raise OperationQueueAuthorityError(
+                    "Worker task is missing its database-authoritative claimed operation id"
+                )
+            if payload_operation_id is not None and str(payload_operation_id) != str(claimed_operation_id):
+                raise OperationQueueAuthorityError(
+                    "Worker task payload operation id does not match its database-authoritative claim"
+                )
+            operation_id = str(claimed_operation_id)
+            # Handlers and terminal helpers consume the public key. Replace a
+            # missing value with the DB-authoritative row id, never vice versa.
+            task_dict["operation_id"] = operation_id
+        else:
+            operation_id = payload_operation_id
 
         # Set schema context for multi-tenant task execution
         schema = task_dict.pop("_schema", None)
@@ -1902,22 +1924,39 @@ class MemoryEngine(MemoryEngineInterface):
             _current_schema.set(schema)
             self._ext_ctx.current_schema = schema
 
-        # Check if operation was cancelled (only for tasks with operation_id)
+        # Prove queue authority before any provider or storage side effect. A
+        # standalone poller supplies its worker id, so horizontally scaled
+        # workers also prove that the processing claim still belongs to this
+        # process. Direct/internal callers without a worker id retain the
+        # legacy status-only check.
         if operation_id:
             try:
                 backend = await self._get_backend()
                 async with acquire_with_retry(backend) as conn:
                     result = await conn.fetchrow(
-                        f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                        f"SELECT status, worker_id FROM {fq_table('async_operations')} WHERE operation_id = $1",
                         uuid.UUID(operation_id),
                     )
                     if not result or result["status"] == "cancelled":
-                        # Operation was cancelled, skip processing
-                        logger.info(f"Skipping cancelled operation: {operation_id}")
+                        logger.info(f"Skipping cancelled or deleted operation: {operation_id}")
+                        return
+                    if expected_worker_id is not None and (
+                        result["status"] != "processing" or result["worker_id"] != expected_worker_id
+                    ):
+                        logger.warning(
+                            "Skipping operation %s because queue authority moved "
+                            "(expected_worker=%s, status=%s, actual_worker=%s)",
+                            operation_id,
+                            expected_worker_id,
+                            result["status"],
+                            result["worker_id"],
+                        )
                         return
             except Exception as e:
                 logger.error(f"Failed to check operation status {operation_id}: {e}")
-                # Continue with processing if we can't check status
+                raise OperationQueueAuthorityError(
+                    f"Failed to prove runnable queue authority for operation {operation_id}"
+                ) from e
 
         consolidation_result: dict | None = None
         bank_id = task_dict.get("bank_id")
@@ -2282,7 +2321,7 @@ class MemoryEngine(MemoryEngineInterface):
                 return row is not None and row["status"] != "cancelled"
         except Exception as e:
             logger.error(f"Failed to check operation liveness {operation_id}: {e}")
-            return True  # Assume alive on DB error to avoid false-positive aborts
+            raise OperationQueueAuthorityError(f"Failed to prove queue liveness for operation {operation_id}") from e
 
     async def _write_operation_progress(
         self,

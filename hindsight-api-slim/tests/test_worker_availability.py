@@ -8,18 +8,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hindsight_api.config import (
+    DEFAULT_WORKER_SATURATION_TIMEOUT_SECONDS,
+    ENV_WORKER_SATURATION_TIMEOUT_SECONDS,
+    HindsightConfig,
+)
 from hindsight_api.engine.memory_engine import MemoryEngine, UnsupportedWorkerTaskError
 from hindsight_api.worker import main as worker_main
-from hindsight_api.worker.exceptions import OperationTerminalStateError
+from hindsight_api.worker.exceptions import OperationQueueAuthorityError, OperationTerminalStateError
 from hindsight_api.worker.main import _wait_for_shutdown_or_worker_failure, create_worker_app
 from hindsight_api.worker.poller import (
     MAX_CONSECUTIVE_POLL_ERRORS,
+    ActiveTaskInfo,
     ClaimedTask,
     SlotAvailability,
     WorkerBackgroundTaskError,
     WorkerPoller,
     WorkerPollingUnavailableError,
+    WorkerSaturationTimeoutError,
 )
+from hindsight_api.worker.stage import StageHolder
 
 
 def test_worker_output_never_serializes_database_url():
@@ -31,9 +39,7 @@ def test_worker_output_never_serializes_database_url():
         target = node.func
         is_print = isinstance(target, ast.Name) and target.id == "print"
         is_logger = (
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "logger"
+            isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "logger"
         )
         if is_print or is_logger:
             assert "database_url" not in ast.unparse(node)
@@ -200,12 +206,421 @@ class _DeniedAuthorityContext:
 
 
 class _DeniedAuthorityBackend:
-    """Minimal backend whose acquisition fails with a non-retryable ACL error."""
+    """Permit the preflight read, then deny the authoritative terminal write."""
+
+    _wraps_backend = True
+
+    def __init__(self):
+        self.acquire_count = 0
+
+    def acquire(self):
+        self.acquire_count += 1
+        if self.acquire_count == 1:
+            connection = AsyncMock()
+            connection.fetchrow.return_value = {"status": "processing", "worker_id": "worker-test"}
+            context = AsyncMock()
+            context.__aenter__.return_value = connection
+            context.__aexit__.return_value = False
+            return context
+        return _DeniedAuthorityContext()
+
+
+class _AlwaysDeniedAuthorityBackend:
+    """Deny even the preflight queue-authority read."""
 
     _wraps_backend = True
 
     def acquire(self):
         return _DeniedAuthorityContext()
+
+
+class _StaticAuthorityBackend:
+    """Return one fixed queue-authority record."""
+
+    _wraps_backend = True
+
+    def __init__(self, row):
+        self.row = row
+
+    def acquire(self):
+        connection = AsyncMock()
+        connection.fetchrow.return_value = self.row
+        context = AsyncMock()
+        context.__aenter__.return_value = connection
+        context.__aexit__.return_value = False
+        return context
+
+
+@pytest.mark.asyncio
+async def test_queue_authority_read_failure_prevents_task_side_effects():
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(return_value=_AlwaysDeniedAuthorityBackend())
+    memory._handle_graph_maintenance = AsyncMock(return_value=None)
+    operation_id = "00000000-0000-0000-0000-000000000098"
+
+    with pytest.raises(OperationQueueAuthorityError, match="Failed to prove runnable queue authority") as raised:
+        await memory.execute_task(
+            {
+                "type": "graph_maintenance",
+                "operation_id": operation_id,
+                "bank_id": "bank-test",
+                "_worker_id": "worker-test",
+                "_operation_id": operation_id,
+            }
+        )
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    memory._handle_graph_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_queue_authority_read_failure_is_not_treated_as_alive():
+    memory = object.__new__(MemoryEngine)
+    memory._get_backend = AsyncMock(return_value=_AlwaysDeniedAuthorityBackend())
+
+    with pytest.raises(OperationQueueAuthorityError, match="Failed to prove queue liveness") as raised:
+        await memory._check_op_alive("00000000-0000-0000-0000-000000000091")
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_moved_queue_authority_prevents_task_side_effects():
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(
+        return_value=_StaticAuthorityBackend({"status": "processing", "worker_id": "worker-peer"})
+    )
+    memory._handle_graph_maintenance = AsyncMock(return_value=None)
+
+    await memory.execute_task(
+        {
+            "type": "graph_maintenance",
+            "operation_id": "00000000-0000-0000-0000-000000000096",
+            "bank_id": "bank-test",
+            "_worker_id": "worker-test",
+            "_operation_id": "00000000-0000-0000-0000-000000000096",
+        }
+    )
+
+    memory._handle_graph_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_startup_recovery_is_scoped_to_exact_worker_owner():
+    connection = AsyncMock()
+    connection.fetch.return_value = [
+        {
+            "operation_id": "00000000-0000-0000-0000-000000000097",
+            "task_payload": {"type": "batch_retain"},
+            "result_metadata": {"batch_id": "batch-1", "batch_provider": "openai"},
+        }
+    ]
+    connection.execute.return_value = "UPDATE 1"
+    context = AsyncMock()
+    context.__aenter__.return_value = connection
+    context.__aexit__.return_value = False
+    backend = MagicMock()
+    backend.acquire.return_value = context
+    poller = WorkerPoller(
+        backend=backend,
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+
+    assert await poller._recover_batch_operations("tenant_a") == 1
+
+    select_sql, select_worker_id = connection.fetch.await_args.args
+    assert "AND worker_id = $1" in select_sql
+    assert select_worker_id == "worker-test"
+    update_sql, _operation_id, update_worker_id = connection.execute.await_args.args
+    assert "AND worker_id = $2" in update_sql
+    assert "AND status = 'processing'" in update_sql
+    assert update_worker_id == "worker-test"
+
+
+async def _claim_one_for_authority_test(task_payload: dict, operation_id: str) -> ClaimedTask:
+    connection = MagicMock()
+    transaction = AsyncMock()
+    transaction.__aenter__.return_value = None
+    transaction.__aexit__.return_value = False
+    connection.transaction.return_value = transaction
+    context = AsyncMock()
+    context.__aenter__.return_value = connection
+    context.__aexit__.return_value = False
+    backend = MagicMock()
+    backend.acquire.return_value = context
+    backend.ops.claim_tasks = AsyncMock(
+        return_value=[
+            {
+                "operation_id": operation_id,
+                "operation_type": "graph_maintenance",
+                "retry_count": 0,
+                "task_payload": task_payload,
+            }
+        ]
+    )
+    poller = WorkerPoller(
+        backend=backend,
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+    )
+    claimed = await poller._claim_batch_for_schema_inner(None, {}, 1)
+    assert len(claimed) == 1
+    return claimed[0]
+
+
+def _authority_test_memory() -> MemoryEngine:
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(
+        return_value=_StaticAuthorityBackend({"status": "processing", "worker_id": "worker-test"})
+    )
+    memory._handle_graph_maintenance = AsyncMock(return_value=None)
+    memory._mark_operation_completed = AsyncMock(return_value=None)
+    return memory
+
+
+@pytest.mark.asyncio
+async def test_poller_binds_missing_payload_id_to_exact_claim_before_engine_side_effects():
+    operation_id = "00000000-0000-0000-0000-000000000095"
+    claimed = await _claim_one_for_authority_test(
+        {"type": "graph_maintenance", "bank_id": "bank-test"},
+        operation_id,
+    )
+    memory = _authority_test_memory()
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=memory.execute_task,
+        tenant_extension=MagicMock(),
+    )
+
+    with patch("hindsight_api.worker.poller.get_metrics_collector", return_value=MagicMock()):
+        await poller._execute_task_inner(claimed)
+
+    assert claimed.task_dict["operation_id"] == operation_id
+    memory._handle_graph_maintenance.assert_awaited_once()
+    memory._mark_operation_completed.assert_awaited_once_with(operation_id)
+
+
+@pytest.mark.asyncio
+async def test_poller_rejects_payload_id_mismatching_exact_claim_before_engine_side_effects():
+    operation_id = "00000000-0000-0000-0000-000000000094"
+    claimed = await _claim_one_for_authority_test(
+        {
+            "type": "graph_maintenance",
+            "operation_id": "00000000-0000-0000-0000-000000000093",
+            "bank_id": "bank-test",
+        },
+        operation_id,
+    )
+    memory = _authority_test_memory()
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=memory.execute_task,
+        tenant_extension=MagicMock(),
+    )
+
+    with (
+        patch("hindsight_api.worker.poller.get_metrics_collector", return_value=MagicMock()),
+        pytest.raises(OperationQueueAuthorityError, match="does not match"),
+    ):
+        await poller._execute_task_inner(claimed)
+
+    memory._handle_graph_maintenance.assert_not_awaited()
+    memory._mark_operation_completed.assert_not_awaited()
+
+
+def test_saturation_timeout_is_explicit_bounded_config(monkeypatch):
+    monkeypatch.delenv(ENV_WORKER_SATURATION_TIMEOUT_SECONDS, raising=False)
+    assert HindsightConfig.from_env().worker_saturation_timeout_seconds == DEFAULT_WORKER_SATURATION_TIMEOUT_SECONDS
+
+    monkeypatch.setenv(ENV_WORKER_SATURATION_TIMEOUT_SECONDS, "1200")
+    assert HindsightConfig.from_env().worker_saturation_timeout_seconds == 1200
+
+    monkeypatch.setenv(ENV_WORKER_SATURATION_TIMEOUT_SECONDS, "299")
+    with pytest.raises(ValueError, match="must be at least 300 seconds"):
+        HindsightConfig.from_env()
+
+
+async def _install_active_tasks(
+    poller: WorkerPoller,
+    *,
+    started_at: float,
+    stage_updates: list[float],
+) -> list[asyncio.Task]:
+    tasks = [asyncio.create_task(asyncio.Event().wait()) for _ in stage_updates]
+    async with poller._in_flight_lock:
+        poller._active_tasks = {
+            f"operation-{index}": ActiveTaskInfo(
+                op_type="retain",
+                bank_id=f"bank-{index}",
+                schema="tenant_a",
+                bg_task=task,
+                started_at=started_at,
+                stage_holder=StageHolder(stage="llm.openrouter.retain", updated_at=updated_at),
+                task_type="batch_retain",
+            )
+            for index, (task, updated_at) in enumerate(zip(tasks, stage_updates, strict=True))
+        }
+        poller._in_flight_count = len(tasks)
+        poller._in_flight_by_type = {"retain": len(tasks)}
+    return tasks
+
+
+async def _cancel_all(tasks: list[asyncio.Task]) -> None:
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_full_saturation_without_progress_clears_readiness_and_fails():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=2,
+        saturation_timeout_seconds=300,
+    )
+    tasks = await _install_active_tasks(poller, started_at=100.0, stage_updates=[200.0, 250.0])
+    poller._ready = True
+    try:
+        with (
+            patch("hindsight_api.worker.poller.time.monotonic", return_value=550.0),
+            pytest.raises(WorkerSaturationTimeoutError, match="occupied all 2 slots") as raised,
+        ):
+            await poller._raise_if_saturated_without_progress()
+        assert "without task/stage progress for 300.0s" in str(raised.value)
+        assert poller.is_ready is False
+    finally:
+        await _cancel_all(tasks)
+
+
+@pytest.mark.asyncio
+async def test_full_saturation_with_recent_stage_progress_remains_ready():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=2,
+        saturation_timeout_seconds=300,
+    )
+    tasks = await _install_active_tasks(poller, started_at=100.0, stage_updates=[200.0, 500.0])
+    poller._ready = True
+    try:
+        with patch("hindsight_api.worker.poller.time.monotonic", return_value=550.0):
+            await poller._raise_if_saturated_without_progress()
+        assert poller.is_ready is True
+    finally:
+        await _cancel_all(tasks)
+
+
+@pytest.mark.asyncio
+async def test_partial_occupancy_does_not_trigger_saturation_recovery():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=2,
+        saturation_timeout_seconds=300,
+    )
+    tasks = await _install_active_tasks(poller, started_at=100.0, stage_updates=[200.0])
+    poller._ready = True
+    try:
+        with patch("hindsight_api.worker.poller.time.monotonic", return_value=1000.0):
+            await poller._raise_if_saturated_without_progress()
+        assert poller.is_ready is True
+    finally:
+        await _cancel_all(tasks)
+
+
+@pytest.mark.asyncio
+async def test_completed_task_waiting_for_cleanup_does_not_trigger_saturation_recovery():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=1,
+        saturation_timeout_seconds=300,
+    )
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    async with poller._in_flight_lock:
+        poller._active_tasks = {
+            "operation-0": ActiveTaskInfo(
+                op_type="retain",
+                bank_id="bank-0",
+                schema="tenant_a",
+                bg_task=task,
+                started_at=100.0,
+                stage_holder=StageHolder(stage="done", updated_at=100.0),
+                task_type="batch_retain",
+            )
+        }
+        poller._in_flight_count = 1
+        poller._in_flight_by_type = {"retain": 1}
+    poller._ready = True
+
+    with patch("hindsight_api.worker.poller.time.monotonic", return_value=1000.0):
+        await poller._raise_if_saturated_without_progress()
+
+    assert poller.is_ready is True
+
+
+@pytest.mark.asyncio
+async def test_empty_active_registry_does_not_crash_saturation_check():
+    poller = WorkerPoller(
+        backend=MagicMock(),
+        worker_id="worker-test",
+        executor=AsyncMock(),
+        tenant_extension=MagicMock(),
+        max_slots=0,
+        saturation_timeout_seconds=300,
+    )
+    poller._ready = True
+
+    with patch("hindsight_api.worker.poller.time.monotonic", return_value=1000.0):
+        await poller._raise_if_saturated_without_progress()
+
+    assert poller.is_ready is True
+
+
+@pytest.mark.asyncio
+async def test_saturation_timeout_is_supervised_fatal_without_poll_retries():
+    poller = _poller()
+    poller.recover_own_tasks = AsyncMock(return_value=0)
+    poller._raise_if_saturated_without_progress = AsyncMock(
+        side_effect=WorkerSaturationTimeoutError("all slots wedged")
+    )
+    poller.claim_batch = AsyncMock()
+
+    poller_task = asyncio.create_task(poller.run())
+    http_task = asyncio.create_task(asyncio.Event().wait())
+    try:
+        with pytest.raises(RuntimeError, match="poller task failed") as raised:
+            await _wait_for_shutdown_or_worker_failure(asyncio.Event(), poller_task, http_task)
+        assert isinstance(raised.value.__cause__, WorkerSaturationTimeoutError)
+        assert str(raised.value.__cause__) == "all slots wedged"
+    finally:
+        await _cancel(http_task)
+
+    poller.claim_batch.assert_not_awaited()
+    assert poller.is_ready is False
 
 
 @pytest.mark.asyncio
@@ -438,6 +853,8 @@ async def test_real_terminal_helper_failure_drops_health_during_claim_and_fails_
             "operation_type": task_type,
             "operation_id": operation_id,
             "bank_id": "bank-test",
+            "_worker_id": "worker-test",
+            "_operation_id": operation_id,
         },
         schema=None,
     )
@@ -475,9 +892,7 @@ async def test_real_terminal_helper_failure_drops_health_during_claim_and_fails_
     poller_task = asyncio.create_task(poller.run())
     app.state.poller_task = poller_task
     http_task = asyncio.create_task(asyncio.Event().wait())
-    supervisor_task = asyncio.create_task(
-        _wait_for_shutdown_or_worker_failure(asyncio.Event(), poller_task, http_task)
-    )
+    supervisor_task = asyncio.create_task(_wait_for_shutdown_or_worker_failure(asyncio.Event(), poller_task, http_task))
     try:
         await asyncio.wait_for(claim_in_flight.wait(), timeout=1)
         await asyncio.wait_for(poller._fatal_task_event.wait(), timeout=1)

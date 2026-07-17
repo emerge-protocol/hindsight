@@ -8,18 +8,15 @@ Tests cover:
 - Worker recovery on restart
 """
 
-import asyncio
 import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from hindsight_api import RequestContext
 from hindsight_api.config import HindsightConfig
-from hindsight_api.engine.llm_wrapper import create_llm_provider
 from hindsight_api.engine.retain.fact_extraction import (
     RetainContent,
     extract_facts_from_contents,
@@ -473,9 +470,10 @@ async def test_batch_api_raises_for_unsupported_provider(mock_llm_config, test_c
 
 @pytest.mark.asyncio
 async def test_worker_batch_recovery(memory, request_context):
-    """Test that WorkerPoller._recover_batch_operations finds and resets orphaned batches."""
+    """Startup recovers only this worker's orphaned batch, never a live peer's."""
     bank_id = f"test_worker_recovery_{datetime.now(timezone.utc).timestamp()}"
     operation_id = str(uuid.uuid4())  # Must be UUID for async_operations table
+    foreign_operation_id = str(uuid.uuid4())
 
     try:
         # Ensure bank exists
@@ -496,22 +494,29 @@ async def test_worker_batch_recovery(memory, request_context):
             "contents": [{"content": "test", "event_date": "2024-01-15T00:00:00Z"}],
         }
 
-        await pool.execute(
-            f"""
-            INSERT INTO {table} (operation_id, operation_type, bank_id, status, worker_id, result_metadata, task_payload)
-            VALUES ($1, 'retain', $2, 'processing', 'worker_crashed', $3::jsonb, $4::jsonb)
-            """,
-            operation_id,
-            bank_id,
-            json.dumps(
-                {
-                    "batch_id": batch_id,
-                    "batch_provider": "openai",
-                    "chunk_count": 1,
-                }
-            ),
-            json.dumps(task_payload),
+        result_metadata = json.dumps(
+            {
+                "batch_id": batch_id,
+                "batch_provider": "openai",
+                "chunk_count": 1,
+            }
         )
+        for candidate_operation_id, worker_id in (
+            (operation_id, "test_worker_recovery"),
+            (foreign_operation_id, "live_peer_worker"),
+        ):
+            await pool.execute(
+                f"""
+                INSERT INTO {table}
+                    (operation_id, operation_type, bank_id, status, worker_id, result_metadata, task_payload)
+                VALUES ($1, 'retain', $2, 'processing', $3, $4::jsonb, $5::jsonb)
+                """,
+                candidate_operation_id,
+                bank_id,
+                worker_id,
+                result_metadata,
+                json.dumps(task_payload),
+            )
 
         # Create WorkerPoller
         from hindsight_api.extensions.builtin.tenant import DefaultTenantExtension
@@ -532,8 +537,7 @@ async def test_worker_batch_recovery(memory, request_context):
         # Run recovery
         recovered_count = await poller._recover_batch_operations(schema)
 
-        # Verify recovery
-        assert recovered_count == 1, "Should recover 1 batch operation"
+        assert recovered_count == 1, "Should recover only its own batch operation"
 
         # Verify operation was reset to pending
         row = await pool.fetchrow(
@@ -543,6 +547,13 @@ async def test_worker_batch_recovery(memory, request_context):
 
         assert row["status"] == "pending", "Operation should be reset to pending"
         assert row["worker_id"] is None, "Worker ID should be cleared"
+
+        foreign_row = await pool.fetchrow(
+            f"SELECT status, worker_id FROM {table} WHERE operation_id = $1",
+            foreign_operation_id,
+        )
+        assert foreign_row["status"] == "processing", "A live peer's batch must remain claimed"
+        assert foreign_row["worker_id"] == "live_peer_worker", "A live peer's ownership must not be changed"
 
         logger.info("✅ Worker batch recovery test passed")
 

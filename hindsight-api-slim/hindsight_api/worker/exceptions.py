@@ -32,3 +32,7 @@ class DeferOperation(Exception):
 
 class OperationTerminalStateError(RuntimeError):
     """A task could not persist its authoritative terminal queue state."""
+
+
+class OperationQueueAuthorityError(OperationTerminalStateError):
+    """A task could not prove that it still owns runnable queue work."""

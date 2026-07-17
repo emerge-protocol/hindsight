@@ -272,6 +272,7 @@ def main():
     print(f"  Poll interval: {args.poll_interval}ms")
     print(f"  Max retries: {args.max_retries}")
     print(f"  Max slots: {config.worker_max_slots}")
+    print(f"  Saturation timeout: {config.worker_saturation_timeout_seconds}s")
     reservations = config.worker_slot_reservations
     reservations_str = ", ".join(f"{k}={v}" for k, v in reservations.items()) if reservations else "none"
     shared_pool = max(0, config.worker_max_slots - sum(reservations.values()))
@@ -345,6 +346,7 @@ def main():
             schema=schema,
             tenant_extension=tenant_extension,
             max_slots=config.worker_max_slots,
+            saturation_timeout_seconds=config.worker_saturation_timeout_seconds,
             slot_reservations=config.worker_slot_reservations,
             consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
         )
