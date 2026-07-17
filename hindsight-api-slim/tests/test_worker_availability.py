@@ -91,6 +91,38 @@ async def test_supervisor_accepts_only_explicit_shutdown_while_tasks_are_live():
         await _cancel(http_task)
 
 
+@pytest.mark.asyncio
+async def test_supervisor_accepts_clean_http_exit_racing_explicit_shutdown():
+    never = asyncio.Event()
+    poller_task = asyncio.create_task(never.wait())
+    http_task = asyncio.create_task(asyncio.sleep(0))
+    shutdown = asyncio.Event()
+    await http_task
+    assert http_task.done()
+    shutdown.set()
+    try:
+        await _wait_for_shutdown_or_worker_failure(shutdown, poller_task, http_task)
+    finally:
+        await _cancel(poller_task)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_preserves_peer_failure_racing_explicit_shutdown():
+    async def fail():
+        raise RuntimeError("poller crashed during shutdown")
+
+    poller_task = asyncio.create_task(fail())
+    http_task = asyncio.create_task(asyncio.sleep(0))
+    shutdown = asyncio.Event()
+    with pytest.raises(RuntimeError, match="poller crashed during shutdown"):
+        await poller_task
+    assert poller_task.done()
+    shutdown.set()
+    with pytest.raises(RuntimeError, match="poller task failed") as raised:
+        await _wait_for_shutdown_or_worker_failure(shutdown, poller_task, http_task)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
 def _health_endpoint(app):
     return next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/health")
 

@@ -72,6 +72,16 @@ async def _wait_for_shutdown_or_worker_failure(
             return_when=asyncio.FIRST_COMPLETED,
         )
 
+        if shutdown_task in done:
+            # SIGINT/SIGTERM can make uvicorn return in the same event-loop
+            # turn as the explicit shutdown event.  A clean/cancelled peer in
+            # that race is part of normal shutdown; a real peer exception is
+            # still an availability failure and must retain its non-zero exit.
+            for task_name, task in (("poller", poller_task), ("HTTP server", http_task)):
+                if task in done and not task.cancelled() and task.exception() is not None:
+                    raise RuntimeError(f"Worker {task_name} task failed") from task.exception()
+            return
+
         for task_name, task in (("poller", poller_task), ("HTTP server", http_task)):
             if task not in done:
                 continue
@@ -82,10 +92,7 @@ async def _wait_for_shutdown_or_worker_failure(
                 raise RuntimeError(f"Worker {task_name} task failed") from error
             raise RuntimeError(f"Worker {task_name} task exited unexpectedly")
 
-        # Only the explicit shutdown task completed; the runtime tasks are
-        # still live and will be drained by the caller's graceful-shutdown path.
-        if shutdown_task not in done:  # pragma: no cover - defensive invariant
-            raise RuntimeError("Worker supervisor woke without a completed task")
+        raise RuntimeError("Worker supervisor woke without a completed task")  # pragma: no cover
     finally:
         if not shutdown_task.done():
             shutdown_task.cancel()
