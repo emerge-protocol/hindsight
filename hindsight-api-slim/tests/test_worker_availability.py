@@ -8,12 +8,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hindsight_api.engine.memory_engine import UnsupportedWorkerTaskError
+from hindsight_api.engine.memory_engine import MemoryEngine, UnsupportedWorkerTaskError
 from hindsight_api.worker import main as worker_main
+from hindsight_api.worker.exceptions import OperationTerminalStateError
 from hindsight_api.worker.main import _wait_for_shutdown_or_worker_failure, create_worker_app
 from hindsight_api.worker.poller import (
     MAX_CONSECUTIVE_POLL_ERRORS,
     ClaimedTask,
+    SlotAvailability,
     WorkerBackgroundTaskError,
     WorkerPoller,
     WorkerPollingUnavailableError,
@@ -186,6 +188,26 @@ def _poller() -> WorkerPoller:
     )
 
 
+class _DeniedAuthorityContext:
+    async def __aenter__(self):
+        # RuntimeError models a non-transient backend/ACL rejection.  The
+        # acquire helper must not spend its connection-failover retry budget on
+        # it, keeping this test focused on terminal-state propagation.
+        raise RuntimeError("terminal queue update denied")
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _DeniedAuthorityBackend:
+    """Minimal backend whose acquisition fails with a non-retryable ACL error."""
+
+    _wraps_backend = True
+
+    def acquire(self):
+        return _DeniedAuthorityContext()
+
+
 @pytest.mark.asyncio
 async def test_transient_recovery_failure_then_success_gates_readiness():
     poller = _poller()
@@ -257,6 +279,71 @@ async def test_persistent_claim_failure_degrades_health_then_fails_process():
 
 
 @pytest.mark.asyncio
+async def test_real_schema_claim_failure_degrades_health_then_fails_process():
+    """The real claim path must not translate denied authority into an empty queue."""
+    poller = _poller()
+    poller.recover_own_tasks = AsyncMock(return_value=0)
+    poller._get_available_slots = AsyncMock(return_value=SlotAvailability(reserved={}, shared=1))
+    poller._get_schemas = AsyncMock(return_value=["tenant_a"])
+    poller._scan_active_schemas = AsyncMock(return_value={"tenant_a"})
+    poller._claim_batch_for_schema_inner = AsyncMock(side_effect=PermissionError("queue trigger denied"))
+
+    memory = MagicMock()
+    memory._pool = None
+    memory.health_check = AsyncMock(return_value={"status": "healthy", "database": "connected"})
+    app = create_worker_app(poller, memory)
+    endpoint = _health_endpoint(app)
+
+    first_backoff = asyncio.Event()
+    release_backoff = asyncio.Event()
+
+    async def controlled_backoff(_seconds):
+        first_backoff.set()
+        await release_backoff.wait()
+
+    with patch("hindsight_api.worker.poller.asyncio.sleep", side_effect=controlled_backoff):
+        poller_task = asyncio.create_task(poller.run())
+        app.state.poller_task = poller_task
+        await asyncio.wait_for(first_backoff.wait(), timeout=1)
+
+        response = await endpoint()
+        assert response.status_code == 503
+        assert json.loads(response.body)["reason"] == "poller_not_ready"
+
+        release_backoff.set()
+        with pytest.raises(WorkerPollingUnavailableError, match="polling remained unavailable") as raised:
+            await poller_task
+
+    claim_error = raised.value.__cause__
+    assert isinstance(claim_error, RuntimeError)
+    assert 'failed to claim tasks for schema "tenant_a"' in str(claim_error)
+    assert isinstance(claim_error.__cause__, PermissionError)
+    assert poller._claim_batch_for_schema_inner.await_count == MAX_CONSECUTIVE_POLL_ERRORS
+    assert poller.is_ready is False
+
+
+@pytest.mark.asyncio
+async def test_real_schema_scan_failure_propagates_through_claim_batch():
+    """A failed EXISTS probe is an unavailable poll, never an idle schema."""
+    poller = _poller()
+    poller._get_available_slots = AsyncMock(return_value=SlotAvailability(reserved={}, shared=1))
+    poller._get_schemas = AsyncMock(return_value=["tenant_a"])
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=PermissionError("schema select denied"))
+
+    async def real_scan(schemas):
+        return await poller._scan_active_schemas_by_exists(conn, schemas)
+
+    poller._scan_active_schemas = real_scan  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match='failed to scan schema "tenant_a"') as raised:
+        await poller.claim_batch()
+
+    assert isinstance(raised.value.__cause__, PermissionError)
+    conn.fetchval.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_successful_claim_cycle_restores_readiness_after_transient_failure():
     poller = _poller()
     poller.recover_own_tasks = AsyncMock(return_value=0)
@@ -322,6 +409,100 @@ async def test_terminal_queue_update_failure_fails_ready_poller():
     assert str(raised.value.__cause__) == "queue update unavailable"
     assert poller.is_ready is False
     poller._mark_failed.assert_awaited_once_with(task.operation_id, "executor rejected payload", "tenant_a")
+
+
+@pytest.mark.parametrize("terminal_path", ["completed", "failed", "consolidation"])
+@pytest.mark.asyncio
+async def test_real_terminal_helper_failure_drops_health_during_claim_and_fails_supervisor(terminal_path):
+    """Every worker-owned terminal write fails closed, even during an in-flight claim."""
+    backend = _DeniedAuthorityBackend()
+    memory = object.__new__(MemoryEngine)
+    memory._audit_logger = None
+    memory._ext_ctx = MagicMock()
+    memory._get_backend = AsyncMock(return_value=backend)
+    memory._webhook_manager = None
+    memory._handle_graph_maintenance = AsyncMock(return_value=None)
+    memory._handle_consolidation = AsyncMock(return_value={"observations_created": 1})
+
+    if terminal_path == "failed":
+        memory._handle_graph_maintenance = AsyncMock(
+            side_effect=ValueError("embedding 0 has dimension 0; expected 384")
+        )
+
+    operation_id = "00000000-0000-0000-0000-000000000099"
+    task_type = "consolidation" if terminal_path == "consolidation" else "graph_maintenance"
+    claimed = ClaimedTask(
+        operation_id=operation_id,
+        task_dict={
+            "type": task_type,
+            "operation_type": task_type,
+            "operation_id": operation_id,
+            "bank_id": "bank-test",
+        },
+        schema=None,
+    )
+
+    poller = WorkerPoller(
+        backend=backend,
+        worker_id="worker-test",
+        executor=memory.execute_task,
+        tenant_extension=MagicMock(),
+    )
+    poller.recover_own_tasks = AsyncMock(return_value=0)
+    poller._log_progress_if_due = AsyncMock()
+
+    claim_in_flight = asyncio.Event()
+    release_claim = asyncio.Event()
+    claim_count = 0
+
+    async def controlled_claim():
+        nonlocal claim_count
+        claim_count += 1
+        if claim_count == 1:
+            return [claimed]
+        claim_in_flight.set()
+        await release_claim.wait()
+        return []
+
+    poller.claim_batch = AsyncMock(side_effect=controlled_claim)
+
+    health_memory = MagicMock()
+    health_memory._pool = None
+    health_memory.health_check = AsyncMock(return_value={"status": "healthy", "database": "connected"})
+    app = create_worker_app(poller, health_memory)
+    endpoint = _health_endpoint(app)
+
+    poller_task = asyncio.create_task(poller.run())
+    app.state.poller_task = poller_task
+    http_task = asyncio.create_task(asyncio.Event().wait())
+    supervisor_task = asyncio.create_task(
+        _wait_for_shutdown_or_worker_failure(asyncio.Event(), poller_task, http_task)
+    )
+    try:
+        await asyncio.wait_for(claim_in_flight.wait(), timeout=1)
+        await asyncio.wait_for(poller._fatal_task_event.wait(), timeout=1)
+
+        assert poller.is_ready is False
+        response = await endpoint()
+        assert response.status_code == 503
+        assert json.loads(response.body)["reason"] == "poller_not_ready"
+
+        release_claim.set()
+        with pytest.raises(RuntimeError, match="poller task failed") as raised:
+            await supervisor_task
+
+        poller_failure = raised.value.__cause__
+        assert isinstance(poller_failure, WorkerBackgroundTaskError)
+        terminal_failure = poller_failure.__cause__
+        assert isinstance(terminal_failure, OperationTerminalStateError)
+        assert terminal_path in str(terminal_failure) or terminal_path == "failed"
+        assert isinstance(terminal_failure.__cause__, RuntimeError)
+        assert poller.claim_batch.await_count == 2
+    finally:
+        release_claim.set()
+        await _cancel(supervisor_task)
+        await _cancel(poller_task)
+        await _cancel(http_task)
 
 
 @pytest.mark.asyncio

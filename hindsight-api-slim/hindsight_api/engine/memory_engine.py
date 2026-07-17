@@ -41,7 +41,7 @@ from ..config import (
 )
 from ..tracing import create_operation_span
 from ..utils import mask_network_location
-from ..worker.exceptions import DeferOperation, RetryTaskAt
+from ..worker.exceptions import DeferOperation, OperationTerminalStateError, RetryTaskAt
 from ..worker.stage import set_stage
 from .audit import AuditLogger, audit_context
 from .bank_stats_cache import BankStatsCache, DistributedBankStatsCache
@@ -1962,7 +1962,7 @@ class MemoryEngine(MemoryEngineInterface):
 
                 audit_entry.response = {"status": "completed", "operation_id": operation_id}
 
-            except UnsupportedWorkerTaskError:
+            except (UnsupportedWorkerTaskError, OperationTerminalStateError):
                 # The poller owns the exact terminal queue transition.  Let it
                 # mark this existing row failed without retry or DELETE.
                 raise
@@ -2362,6 +2362,12 @@ class MemoryEngine(MemoryEngineInterface):
                     await self._maybe_update_parent_operation(operation_id, conn)
         except Exception as e:
             logger.error(f"Failed to mark operation as failed {operation_id}: {e}")
+            # Worker execution cannot report success while its authoritative
+            # terminal state remains `processing`.  Let the poller fail closed
+            # and its supervisor restart/recover the claim.
+            raise OperationTerminalStateError(
+                f"Failed to persist failed terminal state for operation {operation_id}"
+            ) from e
 
     async def _mark_operation_completed(self, operation_id: str):
         """Helper to mark an operation as completed in the database.
@@ -2395,6 +2401,9 @@ class MemoryEngine(MemoryEngineInterface):
                     await self._maybe_update_parent_operation(operation_id, conn)
         except Exception as e:
             logger.error(f"Failed to mark operation as completed {operation_id}: {e}")
+            raise OperationTerminalStateError(
+                f"Failed to persist completed terminal state for operation {operation_id}"
+            ) from e
 
     async def _write_retain_outcome_metadata(self, operation_id: str | None, unit_ids: list[list[str]]) -> None:
         """Persist completed retain outcome fields before the operation is marked completed."""
@@ -2494,6 +2503,9 @@ class MemoryEngine(MemoryEngineInterface):
                         await self._webhook_manager.fire_event_with_conn(event, conn, schema=schema)
         except Exception as e:
             logger.error(f"Failed to mark operation completed and fire webhook {operation_id}: {e}")
+            raise OperationTerminalStateError(
+                f"Failed to persist consolidation terminal state for operation {operation_id}"
+            ) from e
 
     async def _maybe_update_parent_operation(self, child_operation_id: str, conn):
         """Check if this is a child operation and update parent status if all siblings are done.

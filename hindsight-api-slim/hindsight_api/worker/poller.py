@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..engine.schema import fq_table_explicit as fq_table
 from ..metrics import get_metrics_collector
-from .exceptions import DeferOperation, RetryTaskAt
+from .exceptions import DeferOperation, OperationTerminalStateError, RetryTaskAt
 from .stage import StageHolder, bind_holder
 
 # Map DB operation_type -> metric `operation` label, collapsing the retain
@@ -294,8 +294,14 @@ class WorkerPoller:
                 )
                 if has_work:
                     active.add(schema)
-            except Exception:
-                pass
+            except Exception as e:
+                # A failed EXISTS probe is not evidence that the schema is
+                # idle.  Treating it as an empty queue would let the worker
+                # report ready while authority or database access is broken.
+                schema_display = f'"{schema}"' if schema else str(schema)
+                raise RuntimeError(
+                    f"Worker {self._worker_id} failed to scan schema {schema_display} for pending work"
+                ) from e
         return active
 
     async def _get_available_slots(self) -> SlotAvailability:
@@ -473,10 +479,13 @@ class WorkerPoller:
         try:
             return await self._claim_batch_for_schema_inner(schema, reserved_limits, shared_limit)
         except Exception as e:
-            # Format schema for logging: custom schemas in quotes, None as-is
+            # A failed claim is not an empty queue.  Propagate it into the
+            # bounded polling-failure gate so health drops and supervision can
+            # restart a worker that has lost queue authority.
             schema_display = f'"{schema}"' if schema else str(schema)
-            logger.warning(f"Worker {self._worker_id} failed to claim tasks for schema {schema_display}: {e}")
-            return []
+            raise RuntimeError(
+                f"Worker {self._worker_id} failed to claim tasks for schema {schema_display}"
+            ) from e
 
     async def _claim_batch_for_schema_inner(
         self, schema: str | None, reserved_limits: dict[str, int], shared_limit: int
@@ -637,10 +646,11 @@ class WorkerPoller:
                 f"{'failed' if any_failed else 'completed'} (all siblings done)"
             )
         except Exception as e:
-            # Log but don't re-raise — the child has already been marked failed,
-            # which is the critical state change. A stuck parent will be caught on
-            # the next run or via monitoring.
             logger.error(f"Failed to update parent operation for child {child_operation_id}: {e}")
+            # This runs inside the child's terminal transaction.  Roll the
+            # transaction back and fail the poller instead of committing a
+            # terminal child while silently stranding its parent.
+            raise
 
     async def _schedule_retry(self, operation_id: str, retry_at: "Any", error_message: str, schema: str | None):
         """Reset task to pending with a future retry timestamp."""
@@ -737,6 +747,9 @@ class WorkerPoller:
         if failure is not None and self._fatal_task_error is None:
             self._fatal_task_error = failure
             self._fatal_task_event.set()
+            # Health must fail at the callback boundary, including while the
+            # polling loop is blocked in a database claim.
+            self._ready = False
             logger.critical(
                 f"Worker {self._worker_id} background task {operation_id} could not persist terminal queue state",
                 exc_info=(type(failure), failure, failure.__traceback__),
@@ -829,6 +842,11 @@ class WorkerPoller:
             await self._executor(task.task_dict)
             logger.debug(f"Task {task.operation_id} execution finished")
             terminal_success = True
+        except OperationTerminalStateError:
+            # The task may already have completed its external side effects.
+            # Do not rewrite this as an ordinary task failure or retry; fail
+            # the poller so startup recovery can release the processing claim.
+            raise
         except DeferOperation as e:
             # Deferral is not a terminal outcome — do not record a completion.
             await self._defer_operation(task.operation_id, e.exec_date, e.reason, task.schema)
@@ -999,6 +1017,10 @@ class WorkerPoller:
                     # below succeeds, proving it can actually interrogate and
                     # service its queue after startup recovery.
                     tasks = await self.claim_batch()
+                    # A background terminal write may have failed while the
+                    # claim was in flight.  Do not spawn the returned work or
+                    # reassert readiness before observing that fatal state.
+                    self._raise_if_background_task_failed()
 
                     if tasks:
                         # Log batch info
@@ -1025,6 +1047,7 @@ class WorkerPoller:
                         for task in tasks:
                             await self.execute_task(task)
 
+                        self._raise_if_background_task_failed()
                         self._ready = True
                         consecutive_poll_errors = 0
                         # Continue immediately to claim more tasks (if slots available)
@@ -1033,6 +1056,7 @@ class WorkerPoller:
                     # Log progress stats periodically
                     await self._log_progress_if_due()
 
+                    self._raise_if_background_task_failed()
                     self._ready = True
                     consecutive_poll_errors = 0
 
